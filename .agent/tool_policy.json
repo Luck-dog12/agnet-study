@@ -1,0 +1,90 @@
+{
+  "version": 5,
+  "file_access": {
+    "allowed_path_patterns": [
+      "*",
+      "**/*"
+    ],
+    "protected_path_segments": [
+      ".agent",
+      ".git",
+      ".venv",
+      "__pycache__",
+      ".mypy_cache",
+      ".pytest_cache",
+      ".ruff_cache"
+    ],
+    "protected_file_names": [
+      ".env"
+    ],
+    "protected_file_prefixes": [
+      ".env."
+    ],
+    "protected_relative_paths": [
+      "data/pending",
+      "data/sessions",
+      "code.md",
+      "skills"
+    ]
+  },
+  "shell_commands": {
+    "unittest": {
+      "enabled": true,
+      "requires_confirmation": true,
+      "max_paths": 1
+    },
+    "compileall": {
+      "enabled": true,
+      "requires_confirmation": false,
+      "max_paths": 8
+    },
+    "validate_json": {
+      "enabled": true,
+      "requires_confirmation": false,
+      "max_paths": 8
+    },
+    "format_json": {
+      "enabled": true,
+      "requires_confirmation": false,
+      "max_paths": 8
+    },
+    "remove_file": {
+      "enabled": true,
+      "requires_confirmation": true,
+      "max_paths": 1
+    },
+    "clear_file": {
+      "enabled": true,
+      "requires_confirmation": true,
+      "max_paths": 1
+    },
+    "clear_directory": {
+      "enabled": true,
+      "requires_confirmation": true,
+      "max_paths": 1
+    },
+    "python": {
+      "enabled": true,
+      "requires_confirmation": false,
+      "max_paths": 1
+    }
+  },
+  "code_interpreter": {
+    "enabled": true,
+    "max_ast_nodes": 512,
+    "max_timeout_seconds": 10,
+    "max_output_characters": 16384,
+    "max_memory_mb": 256,
+    "max_processes": 2
+  },
+  "network": {
+    "fetch_enabled": true,
+    "search_enabled": true,
+    "allow_http": true,
+    "max_response_bytes": 1048576,
+    "max_timeout_seconds": 20,
+    "max_redirects": 3,
+    "search_max_response_bytes": 1048576,
+    "search_max_timeout_seconds": 20
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:ListObjects"
+      ],
+      "Resource": [
+        "acs:oss:*:*:coding-agent"
+      ],
+      "Condition": {
+        "StringLike": {
+          "oss:Prefix": [
+            "projects/coding-agent/runs/connectivity-probe",
+            "projects/coding-agent/runs/connectivity-probe/*"
+          ]
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:GetObject",
+        "oss:PutObject",
+        "oss:DeleteObject",
+        "oss:ListParts",
+        "oss:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "acs:oss:*:*:coding-agent/projects/coding-agent/runs/connectivity-probe/*"
+      ]
+    }
+  ]
+}

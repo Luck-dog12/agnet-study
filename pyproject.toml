@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agnet-study"
+version = "0.1.0"
+description = "A single-agent coding assistant backed by a DeepSeek-compatible API."
+requires-python = ">=3.11"
+dependencies = [
+    "e2b==2.49.1",
+    "openai==2.54.0",
+    "python-dotenv==1.2.3",
+    "pydantic==2.13.5",
+    "prompt_toolkit==3.0.53",
+]
+
+[project.scripts]
+agent = "app.main:main"
+sandbox-probe = "app.aliyun_sandbox_probe:main"
+sandbox-recovery-probe = "app.aliyun_sandbox_recovery_probe:main"
+
+[tool.setuptools]
+packages = ["app", "tool"]

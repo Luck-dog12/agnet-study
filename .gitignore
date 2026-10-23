@@ -1,0 +1,59 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+!.env.example
+
+# Local credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+service-account.json
+service_account.json
+client_secret*.json
+.npmrc
+.pypirc
+.netrc
+
+# Cloud and infrastructure credentials/state
+.aws/
+.azure/
+.kube/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Local databases, logs, and browser profiles
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.test-tmp/
+
+# Generated runtime and test data
+.archify/
+.agents/skills/archify/
+data/log/
+data/pending/
+data/sessions/
+data/tmp*/
+tests/write-file-tests-*/
+
+# Python tooling/build output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
