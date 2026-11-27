@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Validate release commit
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish tested source
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+      - name: Validate tag and create source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo 'Release tag must be a version such as v0.1.0.' >&2
+            exit 1
+          fi
+          python -m venv .venv
+          version="$(.venv/bin/python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo 'Release tag must match project.version in pyproject.toml.' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          archive="agnet-study-${RELEASE_TAG}.zip"
+          git archive --format=zip --prefix="agnet-study-${RELEASE_TAG}/" --output="dist/$archive" HEAD
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+      - name: Create GitHub Release without replacing an existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          remote_sha="$(gh api "repos/${GH_REPO}/commits/${RELEASE_TAG}" --jq .sha)"
+          if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
+            echo 'Release tag no longer points to the tested commit.' >&2
+            exit 1
+          fi
+          # create fails if the release already exists; no edit/upload --clobber.
+          gh release create "$RELEASE_TAG" \
+            "dist/agnet-study-${RELEASE_TAG}.zip" dist/SHA256SUMS \
+            --verify-tag --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" --generate-notes

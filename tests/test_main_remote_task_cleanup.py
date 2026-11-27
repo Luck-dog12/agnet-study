@@ -33,6 +33,11 @@ class _FakeSandboxSettings:
 
 
 class MainRemoteTaskCleanupTests(unittest.TestCase):
+    def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
+
     def _create_session(
         self,
         sessions: Path,
@@ -317,7 +322,11 @@ class MainRemoteTaskCleanupTests(unittest.TestCase):
                 self.assertEqual(backend, "aliyun-sandbox")
                 self.assertEqual(observed_session, session_id)
                 self.assertIs(settings, sandbox_settings)
-                self.assertEqual(kwargs, {"collect_orphans": True})
+                self.assertEqual(kwargs, {
+                    "collect_orphans": True,
+                    "session_directory": _path,
+                    "session_cleanup_complete": True,
+                })
                 return runtime
 
             agent = Mock()

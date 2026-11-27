@@ -35,6 +35,7 @@ from app.aliyun_sandbox_session_cleanup import (
     SANDBOX_OWNER_METADATA_KEY,
     SANDBOX_OWNER_METADATA_VALUE,
     SANDBOX_SESSION_METADATA_KEY,
+    SANDBOX_GENERATION_METADATA_KEY,
     SandboxRecoveryPage,
     _E2BSandboxRecoveryProvider,
     _scan_active,
@@ -170,7 +171,7 @@ class _ControlledProviderKillExceptionObserver:
             )
 
     def direct_kill(self, *args: object, **kwargs: object) -> object:
-        if args or kwargs:
+        if args or (kwargs and kwargs != {"request_timeout": 10}):
             raise _HarnessError(
                 "provider kill exception live direct kill 调用无效。"
             )
@@ -790,15 +791,21 @@ class NaturalKillExceptionHarnessOfflineTests(unittest.TestCase):
             ):
                 nonlocal list_calls
                 del states, limit, next_token, request_timeout
-                self.assertEqual(metadata, expected_metadata)
                 list_calls += 1
+                if list_calls <= 2:
+                    self.assertEqual(metadata, expected_metadata)
+                else:
+                    self.assertEqual(metadata, {
+                        **expected_metadata,
+                        SANDBOX_GENERATION_METADATA_KEY: backend._generation_id,
+                    })
                 if list_calls in {1, 2, 4}:
                     return SandboxRecoveryPage(items=())
                 if list_calls == 3:
                     return SandboxRecoveryPage(items=(SimpleNamespace(
                         sandbox_id=target,
                         state="running",
-                        metadata=expected_metadata,
+                        metadata=dict(metadata),
                     ),))
                 raise AssertionError("unexpected list")
 
@@ -826,6 +833,7 @@ class NaturalKillExceptionHarnessOfflineTests(unittest.TestCase):
             transport_factory=lambda _sandbox: object(),
             persistence_transport_factory=lambda _sandbox: object(),
             recovery_provider=Provider(),
+            automatic_maintenance=False,
         )
         self.assertEqual(backend.ensure_ready().sandbox_id, target)
         self.assertIsNone(backend.close())

@@ -20,6 +20,9 @@ from app.workspace_seed import WorkspaceSeedEntry, WorkspaceSeedSnapshot
 class _FakeSandboxSettings:
     def __init__(self) -> None:
         self.require_calls = 0
+        self.timeout_seconds = 300
+        self.idle_timeout_seconds = 120
+        self.max_session_seconds = 3600
 
     def require_enabled(self) -> None:
         self.require_calls += 1
@@ -52,6 +55,11 @@ class _StubAgent:
 
 
 class MainExecutionBackendTests(unittest.TestCase):
+    def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
+
     def test_checkpoint_layout_preflight_fails_before_backend_construction(self):
         from app import main as main_module
 
@@ -1213,7 +1221,11 @@ class MainExecutionBackendTests(unittest.TestCase):
             self.assertIs(exact_settings, sandbox_settings)
             self.assertEqual(session_id, bound_session_id)
             self.assertEqual(session_id, captured["workflow"].session_id)
-            self.assertEqual(runtime_kwargs, {"collect_orphans": True})
+            self.assertEqual(runtime_kwargs, {
+                "collect_orphans": True,
+                "session_directory": sessions / "remote-run",
+                "session_cleanup_complete": True,
+            })
             self.assertEqual(call_order, ["runtime", "cleanup"])
             cleanup.assert_called_once_with(sandbox_settings, bound_session_id)
             self.assertIs(captured["agent_runtime"], runtime)
@@ -1285,6 +1297,8 @@ class MainExecutionBackendTests(unittest.TestCase):
                 session_id,
                 sandbox_settings,
                 collect_orphans=True,
+                session_directory=session_path,
+                session_cleanup_complete=True,
             )
             runtime.close.assert_called_once_with()
             client_factory.assert_not_called()

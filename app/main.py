@@ -46,6 +46,13 @@ def create_client(settings):
     return factory(settings)
 
 
+def create_model_service_monitor(settings, *, on_change):
+    """Injectable startup/recovery checker; never constructs a tool runtime."""
+    from app.model_guard import ModelServiceMonitor
+
+    return ModelServiceMonitor(settings, on_change=on_change)
+
+
 def load_settings():
     from app.config import load_settings as loader
 
@@ -86,12 +93,16 @@ def create_execution_runtime(
     sandbox_settings,
     *,
     collect_orphans=False,
+    session_directory: Path | None = None,
+    session_cleanup_complete=False,
 ):
     """首次模型请求捕获 host seed 并组装 runtime；不建立云资源。"""
     if execution_backend != "aliyun-sandbox":
         raise ValueError("仅 aliyun-sandbox 需要远端 execution runtime。")
     if type(collect_orphans) is not bool:
         raise TypeError("collect_orphans 必须是 bool。")
+    if type(session_cleanup_complete) is not bool:
+        raise TypeError("session_cleanup_complete 必须是 bool。")
     from app.execution_backend import AliyunSandboxExecutionBackend
     from app.execution_runtime import ExecutionToolRuntime
 
@@ -103,10 +114,21 @@ def create_execution_runtime(
         )
     else:
         initializer = create_workspace_seed_initializer(snapshot)
+    backend_options = {"workspace_initializer": initializer}
+    if session_cleanup_complete:
+        backend_options["session_cleanup_complete"] = True
+    if session_directory is not None:
+        from app.sandbox_budget import SandboxBudget
+
+        backend_options["budget"] = SandboxBudget(
+            sandbox_settings.max_session_seconds,
+            path=Path(session_directory) / "sandbox-budget.json",
+            session_id=session_id,
+        )
     backend = AliyunSandboxExecutionBackend(
         session_id,
         sandbox_settings,
-        workspace_initializer=initializer,
+        **backend_options,
     )
     try:
         return ExecutionToolRuntime(backend)
@@ -413,6 +435,32 @@ class _LineRequest:
     complete_commands: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _ReadLine:
+    value: object
+    epoch: int
+    model_available: bool
+
+
+_INPUT_DISCARDED = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredInput:
+    prompt: str
+    number: int | None = None
+
+
+def _is_deferred_host_control(prompt: str) -> bool:
+    """Host commands keep their routing semantics without becoming queued tasks."""
+    command = prompt.strip()
+    return (
+        command.casefold() in {"exit", "quit"}
+        or command in {"/status", "/tasks", "/recovery", "/resolve", "/permissions", "/model reset", "/mode plan", "/mode act"}
+        or command.startswith(("/interrupt", "/task ", "/cancel ", "/permissions ", "/recovery ", "/resolve "))
+    )
+
+
 class _InputBroker:
     """Single owner for stdin; routes lines and approval requests without races."""
 
@@ -423,6 +471,9 @@ class _InputBroker:
         self._plan_choices: Queue[_PlanChoiceRequest] = Queue()
         self._lock = Lock()
         self._outstanding = False
+        self._epoch = 0
+        self._model_available = True
+        self._input_state = (self._epoch, self._model_available)
         self._stopped = False
         self._plain = plain
         self._reader = reader
@@ -454,11 +505,43 @@ class _InputBroker:
             self._requests.put(_LineRequest())
             return False
 
+    def invalidate_pending_lines(self) -> None:
+        """Fence submitted input; an empty reader can still accept a later new line."""
+        with self._lock:
+            self._epoch += 1
+            self._input_state = (self._epoch, self._model_available)
+
+    def set_model_available(self, available: bool) -> None:
+        """Change the submission gate and discard lines from the older state."""
+        with self._lock:
+            if self._model_available != available:
+                self._epoch += 1
+                self._model_available = available
+                self._input_state = (self._epoch, available)
+
+    @staticmethod
+    def _is_local_control(value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        command = value.strip().casefold()
+        return (
+            command in {"exit", "quit", "/status", "/tasks", "/recovery"}
+            or command.startswith(("/task ", "/cancel "))
+        )
+
     def get_line(self, timeout: float | None = None) -> object:
-        value = self._lines.get(timeout=timeout)
+        line = self._lines.get(timeout=timeout)
+        assert isinstance(line, _ReadLine)
         with self._lock:
             self._outstanding = False
-        return value
+            reject = (
+                line.epoch != self._epoch
+                or not line.model_available
+                or not self._model_available
+            )
+        if reject and not self._is_local_control(line.value):
+            return _INPUT_DISCARDED
+        return line.value
 
     def poll_line(self, timeout: float = 0.05) -> object | None:
         try:
@@ -547,7 +630,14 @@ class _InputBroker:
             except Exception:
                 # 输入后端失败时安全结束读取，不能让 broker 线程静默死亡并使主线程永久等待。
                 value = _INPUT_EOF
-            self._lines.put(value)
+            # Tag submission, not the start of the blocking stdin read. A user
+            # who waited for recovery can submit a fresh command immediately;
+            # a line already submitted during failure stays rejected forever.
+            epoch, available = self._input_state
+            if not available and not self._is_local_control(value):
+                # Fault-period user text never enters even the stdin queue.
+                value = _INPUT_DISCARDED
+            self._lines.put(_ReadLine(value, epoch, available))
 
 
 def _recovery_command(
@@ -691,8 +781,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
 
-    # 会话存储是显示提示符前唯一必须加载的运行组件。模型协调、异步任务、
-    # 可观测性与 OpenAI SDK 均推迟到用户真正发出模型请求时再加载。
+    # Tool runtimes remain lazy. A separate bounded model check starts before
+    # user requests are accepted and never creates a remote execution runtime.
     from app.workflow import (
         SessionEventError,
         SessionEventWorkflow,
@@ -706,12 +796,17 @@ def main(argv: list[str] | None = None) -> int:
     agent_error_type: type[BaseException] = _NeverRaisedError
     agent_session_error_type: type[BaseException] = _NeverRaisedError
     agent_plan_cancelled_type: type[BaseException] = _NeverRaisedError
+    agent_service_error_types: tuple[type[BaseException], ...] = (_NeverRaisedError,)
+    sandbox_budget_error_type: type[BaseException] = _NeverRaisedError
 
     client = None
     agent: Any = None
+    execution_runtime: Any = None
     selected_session = session_request.choice
     observability = None
     maintenance = None
+    model_service = None
+    deferred: list[_DeferredInput] = []
     session_workflow = None
     executor: DaemonExecutor | None = None
     broker = _InputBroker(plain=arguments.plain)
@@ -723,6 +818,8 @@ def main(argv: list[str] | None = None) -> int:
     emergency_exit = False
     host_permission_mode = arguments.permission_mode
     remote_session_cleaned = False
+    lifecycle_notice_lock = Lock()
+    lifecycle_notices_closed = Event()
     try:
         try:
             settings = load_settings()
@@ -817,17 +914,165 @@ def main(argv: list[str] | None = None) -> int:
 
         ui = ConsoleUI(plain=arguments.plain)
         ui.banner(selected_session.name)
+
+        def on_sandbox_lifecycle(message: str) -> None:
+            # The monitor can notify while the main thread waits for approval.
+            # ConsoleUI serializes notices with model output; this additional
+            # fence prevents callbacks from printing after CLI shutdown starts.
+            with lifecycle_notice_lock:
+                if not lifecycle_notices_closed.is_set():
+                    ui.warning(message)
+
         pending_count = len(session_workflow.unresolved_external_calls())
         if pending_count:
             ui.warning(f"有 {pending_count} 个修改型调用结果待核验；Agent 将先自主检查并确认，期间其他修改工具仍受阻。输入 /recovery 可只读查看。")
         broker.start()
         executor = DaemonExecutor(max_workers=1, thread_name_prefix="agent-cli-run")
-        deferred: list[str] = []
+        next_queue_number = 1
         exit_requested = False
+        from app.model_guard import (
+            MODEL_CHECKING_MESSAGE,
+            MODEL_INPUT_DISCARDED_MESSAGE,
+            MODEL_READY_MESSAGE,
+            MODEL_UNAVAILABLE_MESSAGE,
+        )
+
+        model_state = "checking"
+        model_updates: Queue[str] = Queue()
+        broker.set_model_available(False)
+
+        def on_model_state(state: str) -> None:
+            # No monitor methods are called under the broker lock. The worker
+            # publishes only fixed tokens; all UI stays on the main thread.
+            broker.set_model_available(state == "ready")
+            model_updates.put(state)
+
+        def queued_items() -> tuple[tuple[int, str], ...]:
+            return tuple((item.number, item.prompt) for item in deferred if item.number is not None)
+
+        def enqueue_input(prompt: str) -> None:
+            nonlocal next_queue_number
+            if not prompt.strip():
+                return
+            if _is_deferred_host_control(prompt):
+                deferred.append(_DeferredInput(prompt))
+                return
+            if model_state != "ready":
+                ui.warning(MODEL_INPUT_DISCARDED_MESSAGE)
+                return
+            item = _DeferredInput(prompt, next_queue_number)
+            next_queue_number += 1
+            deferred.append(item)
+            assert item.number is not None
+            ui.queue_received(item.number, item.prompt, queued_items())
+
+        def take_deferred() -> str:
+            item = deferred.pop(0)
+            if item.number is not None:
+                ui.queue_started(item.number, item.prompt, queued_items())
+            return item.prompt
+
+        def discard_deferred(*, reason: str) -> None:
+            nonlocal exit_requested
+            # Exit remains actionable even when it arrived with a failed turn.
+            exit_requested = exit_requested or any(
+                item.prompt.strip().casefold() in {"exit", "quit"} for item in deferred
+            )
+            cancelled = queued_items()
+            deferred.clear()
+            ui.queue_cancelled(cancelled, reason=reason)
+
+        def refresh_model_state() -> None:
+            nonlocal model_state
+            while True:
+                try:
+                    state = model_updates.get_nowait()
+                except Empty:
+                    return
+                if state == model_state:
+                    continue
+                model_state = state
+                discard_deferred(reason="模型服务状态变化")
+                if state == "ready":
+                    ui.status(MODEL_READY_MESSAGE)
+                elif state == "unavailable":
+                    ui.warning(MODEL_UNAVAILABLE_MESSAGE)
+
+        def handle_model_failure(error: BaseException) -> bool:
+            if not isinstance(error, agent_service_error_types):
+                return False
+            discard_deferred(reason="模型服务失败")
+            assert model_service is not None
+            model_service.mark_unavailable()
+            refresh_model_state()
+            return True
+
+        def show_status() -> None:
+            assert settings is not None and selected_session is not None
+            rounds = agent.max_tool_rounds if agent is not None else 8
+            plan_rounds = agent.max_plan_clarifications if agent is not None else 5
+            waiting = queued_items()
+            from app.agent_status import project_agent_status
+
+            assert session_workflow is not None
+            status = (
+                agent.get_status() if agent is not None else
+                project_agent_status(session_workflow.session_id, session_workflow.events)
+            )
+            last_result = status.last_turn.kind if status.last_turn is not None else "none"
+            current_turn = status.current_turn.turn_id if status.current_turn is not None else "none"
+            sandbox_status = ""
+            if resolved_execution_backend == "aliyun-sandbox":
+                assert sandbox_settings is not None
+                if execution_runtime is None:
+                    # Reading status must not take over the budget ledger,
+                    # capture a workspace seed or create cloud resources.
+                    sandbox_status = (
+                        "; sandbox_state=not_created (本进程尚未创建云资源); "
+                        "sandbox_used=待加载; sandbox_remaining=待加载; "
+                        f"sandbox_ttl={sandbox_settings.timeout_seconds}s; "
+                        f"sandbox_idle_limit={sandbox_settings.idle_timeout_seconds}s; "
+                        f"sandbox_session_limit={sandbox_settings.max_session_seconds}s"
+                    )
+                else:
+                    try:
+                        snapshot = execution_runtime.lifecycle_snapshot()
+                    except sandbox_budget_error_type:
+                        ui.warning("沙箱预算状态不可用，已禁止继续创建和续期。")
+                        sandbox_status = (
+                            "; sandbox_state=unavailable; sandbox_used=未知; "
+                            "sandbox_remaining=未知"
+                        )
+                    else:
+                        sandbox_status = (
+                            f"; sandbox_state={snapshot['state']}; "
+                            f"sandbox_used={snapshot['used_seconds']:.1f}s; "
+                            f"sandbox_remaining={snapshot['remaining_seconds']:.1f}s; "
+                            f"sandbox_ttl={snapshot['timeout_seconds']}s; "
+                            f"sandbox_idle_limit={snapshot['idle_timeout_seconds']}s; "
+                            f"sandbox_session_limit={snapshot['max_session_seconds']}s"
+                        )
+            ui.queue_status(
+                f"workflow=act; plan_entry=/plan; session={selected_session.name}; model={settings.model}; "
+                f"model_state={model_state}; run_state={status.run_state}; queued={len(waiting)}; "
+                f"agent_mode={status.mode or 'none'}; current_turn={current_turn}; last_turn={last_result}; "
+                f"tasks_active={status.task_counts.active}; tasks_total={status.task_counts.total}; "
+                f"recovery_pending={status.pending_recovery_count}; "
+                f"timeout={settings.timeout_seconds:g}s; retries={settings.max_retries}; "
+                f"max_tool_rounds={rounds} (单用户轮的含工具 assistant step 上限); "
+                f"max_plan_clarifications={plan_rounds}; "
+                f"execution_backend={resolved_execution_backend}{sandbox_status}",
+                waiting,
+            )
+
+        ui.status(MODEL_CHECKING_MESSAGE)
+        model_service = create_model_service_monitor(settings, on_change=on_model_state)
+        model_service.start()
+
         def read_host_line(prompt_text: str, *, complete_commands: bool = False) -> str | None:
             broker.request_line(prompt_text, complete_commands=complete_commands)
             value = broker.get_line()
-            if value is _INPUT_EOF:
+            if value is _INPUT_EOF or value is _INPUT_DISCARDED:
                 return None
             if value is _INPUT_INTERRUPT:
                 raise KeyboardInterrupt
@@ -837,7 +1082,9 @@ def main(argv: list[str] | None = None) -> int:
         def ensure_runtime() -> Any:
             nonlocal client, agent, observability, maintenance
             nonlocal agent_error_type, agent_session_error_type, agent_plan_cancelled_type
+            nonlocal agent_service_error_types
             nonlocal remote_session_cleaned
+            nonlocal execution_runtime, sandbox_budget_error_type
             if agent is not None:
                 return agent
             ui.status("正在初始化模型运行时…")
@@ -846,19 +1093,29 @@ def main(argv: list[str] | None = None) -> int:
             created_observer = None
             created_execution_runtime = None
             try:
-                from app.agent import AgentError, AgentPlanCancelledError, AgentSessionError
+                from app.agent import (
+                    AgentError, AgentModelProtocolError, AgentPlanCancelledError,
+                    AgentRequestError, AgentSessionError,
+                )
 
                 agent_error_type = AgentError
                 agent_session_error_type = AgentSessionError
                 agent_plan_cancelled_type = AgentPlanCancelledError
+                agent_service_error_types = (AgentRequestError, AgentModelProtocolError)
                 if resolved_execution_backend == "aliyun-sandbox":
+                    from app.sandbox_budget import SandboxBudgetError
+
+                    sandbox_budget_error_type = SandboxBudgetError
                     assert sandbox_settings is not None
                     created_execution_runtime = create_execution_runtime(
                         resolved_execution_backend,
                         session_workflow.session_id,
                         sandbox_settings,
                         collect_orphans=True,
+                        session_directory=selected_session.directory,
+                        session_cleanup_complete=True,
                     )
+                    created_execution_runtime.set_lifecycle_callback(on_sandbox_lifecycle)
                     # Runtime construction captures and preflights the host
                     # snapshot but remains cloud-lazy.  Only after those
                     # deterministic checks pass do we prove provider active=0;
@@ -909,6 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
             client = created_client
             observability = created_observer
             agent = created_agent
+            execution_runtime = created_execution_runtime
             try:
                 maintenance = MaintenanceService(observability)
                 maintenance.start()
@@ -923,17 +1181,27 @@ def main(argv: list[str] | None = None) -> int:
 
         while True:
             try:
+                refresh_model_state()
+                if exit_requested:
+                    break
                 if deferred:
-                    prompt = deferred.pop(0)
+                    prompt = take_deferred()
                 else:
                     broker.request_line(ui.prompt_text(), complete_commands=True)
-                    incoming = broker.get_line()
+                    incoming = None
+                    while incoming is None:
+                        refresh_model_state()
+                        incoming = broker.poll_line()
+                    refresh_model_state()
                     if incoming is _INPUT_EOF:
                         print()
                         break
                     if incoming is _INPUT_INTERRUPT:
                         print("\n已退出。")
                         break
+                    if incoming is _INPUT_DISCARDED:
+                        ui.warning(MODEL_INPUT_DISCARDED_MESSAGE)
+                        continue
                     assert isinstance(incoming, str)
                     prompt = incoming
             except (EOFError, KeyboardInterrupt):
@@ -953,15 +1221,30 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
             if stripped == "/status":
-                assert settings is not None and selected_session is not None
-                rounds = agent.max_tool_rounds if agent is not None else 8
-                plan_rounds = agent.max_plan_clarifications if agent is not None else 5
-                ui.status(
-                    f"workflow=act; plan_entry=/plan; session={selected_session.name}; model={settings.model}; "
-                    f"timeout={settings.timeout_seconds:g}s; retries={settings.max_retries}; "
-                    f"max_tool_rounds={rounds} (单用户轮的含工具 assistant step 上限); "
-                    f"max_plan_clarifications={plan_rounds}"
-                )
+                show_status()
+                continue
+            if stripped == "/model reset":
+                ui.warning("该命令已移除；模型服务会自动检查恢复，请在可用后输入新需求。")
+                continue
+            if model_state != "ready":
+                # Previously dispatched jobs remain inspectable/cancellable;
+                # these commands never request a model continuation.
+                if agent is not None:
+                    try:
+                        if (
+                            stripped == "/tasks"
+                            or stripped.startswith(("/task ", "/cancel "))
+                        ) and _async_command(agent, prompt, reinvoke_after_interrupt=False):
+                            continue
+                        if _recovery_command(agent, prompt):
+                            continue
+                    except agent_session_error_type as exc:
+                        ui.error(f"会话已停止：{exc}")
+                        return 3
+                    except agent_error_type as exc:
+                        ui.warning(str(exc))
+                        continue
+                ui.warning(MODEL_INPUT_DISCARDED_MESSAGE)
                 continue
             if stripped == "/permissions" or stripped.startswith("/permissions "):
                 permission_parts = stripped.split()
@@ -1042,6 +1325,9 @@ def main(argv: list[str] | None = None) -> int:
             except (agent_session_error_type, SessionEventError):
                 ui.error("会话已损坏或无法安全恢复。")
                 return 2
+            except sandbox_budget_error_type:
+                ui.error("沙箱时长预算记录异常，无法安全启动远端执行；预算不会自动清零。")
+                return 2
             except Exception:
                 ui.error("无法初始化模型运行时，请检查 SDK 与配置。")
                 return 2
@@ -1057,6 +1343,12 @@ def main(argv: list[str] | None = None) -> int:
             except agent_session_error_type as exc:
                 print(f"会话已停止：{exc}", file=sys.stderr)
                 return 3
+            except agent_error_type as exc:
+                # Idle /interrupt can synchronously ask the model to reassess.
+                # Its failures must install the same input boundary as run().
+                ui.error(f"Agent 错误：{exc}")
+                handle_model_failure(exc)
+                continue
             except (EOFError, KeyboardInterrupt):
                 print("\n核验已取消。")
                 continue
@@ -1065,10 +1357,9 @@ def main(argv: list[str] | None = None) -> int:
 
             def write_delta(delta: str) -> None:
                 nonlocal streamed
-                if not streamed:
-                    ui.start_assistant()
+                if delta:
                     streamed = True
-                ui.text(delta, end="")
+                    ui.stream_text(delta)
 
             runner = active_agent.plan if plan_request else active_agent.run
             # Consecutive Ctrl+C escalation belongs to this generation only.
@@ -1091,6 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
                 nonlocal exit_requested, emergency_exit
                 exit_requested = True
                 emergency_exit = True
+                discard_deferred(reason="用户退出")
                 try:
                     active_agent.cancel_for_shutdown()
                 except BaseException:
@@ -1143,8 +1435,11 @@ def main(argv: list[str] | None = None) -> int:
                                 if incoming.strip().casefold() in {"exit", "quit"}:
                                     begin_emergency_exit()
                                     return "emergency", None
+                                if incoming.strip() == "/status":
+                                    show_status()
+                                    continue
                                 if incoming.strip():
-                                    deferred.append(incoming)
+                                    enqueue_input(incoming)
                         return "result", future.result(timeout=0.05)
                     except FutureTimeout:
                         continue
@@ -1168,7 +1463,8 @@ def main(argv: list[str] | None = None) -> int:
                         plan_choice = broker.poll_plan_choice()
                         if plan_choice is not None:
                             active_plan_choice = plan_choice
-                            prompt_text = _show_plan_choice(plan_choice)
+                            with ui.host_output():
+                                prompt_text = _show_plan_choice(plan_choice)
                             selected_index: int | None = None
                             while selected_index is None and not plan_choice.ready.is_set():
                                 if background_input_exhausted:
@@ -1190,6 +1486,9 @@ def main(argv: list[str] | None = None) -> int:
                                 if normalized in {"exit", "quit"}:
                                     begin_emergency_exit()
                                     break
+                                if normalized == "/status":
+                                    show_status()
+                                    continue
                                 if normalized.startswith("/interrupt"):
                                     break
                                 if normalized in {"1", "2", "3"}:
@@ -1205,15 +1504,23 @@ def main(argv: list[str] | None = None) -> int:
                         approval = broker.poll_approval()
                         if approval is not None:
                             active_approval = approval
-                            print(_show_confirmation(approval.request), end="", flush=True)
+                            with ui.host_output():
+                                print(_show_confirmation(approval.request), end="", flush=True)
                             if background_input_exhausted:
                                 # 当前抢先读取通道已经耗尽，不能把下一轮稍后到达的
                                 # 用户消息误当成这一轮工具审批；无明确 yes 即拒绝。
                                 broker.resolve_approval(approval, "no")
                                 active_approval = None
                                 continue
-                            broker.request_or_adopt_approval_line()
-                            answer = broker.get_line()
+                            while True:
+                                broker.request_or_adopt_approval_line()
+                                answer = broker.get_line()
+                                if isinstance(answer, str) and answer.strip() == "/status":
+                                    show_status()
+                                    with ui.host_output():
+                                        print("请继续输入 yes 批准或 no 拒绝：", end="", flush=True)
+                                    continue
+                                break
                             if answer is _INPUT_INTERRUPT:
                                 try:
                                     active_agent.interrupt("用户在审批期间通过 Ctrl+C 发出紧急中断。")
@@ -1262,15 +1569,21 @@ def main(argv: list[str] | None = None) -> int:
                         incoming = broker.poll_line()
                         if incoming is None:
                             continue
+                        if isinstance(incoming, str) and incoming.strip() == "/status":
+                            show_status()
+                            continue
+                        if incoming is _INPUT_DISCARDED:
+                            ui.warning(MODEL_INPUT_DISCARDED_MESSAGE)
+                            continue
                         if future.done():
                             # The model may finish in the narrow interval after
                             # stdin became readable. Treat that line as the next
                             # idle command instead of turning a normal `exit`
                             # into an emergency shutdown.
                             if isinstance(incoming, str) and incoming.strip():
-                                deferred.append(incoming)
+                                enqueue_input(incoming)
                             elif incoming is _INPUT_INTERRUPT:
-                                deferred.append("/interrupt")
+                                enqueue_input("/interrupt")
                             break
                         if incoming is _INPUT_EOF:
                             background_input_exhausted = True
@@ -1295,41 +1608,47 @@ def main(argv: list[str] | None = None) -> int:
                             except FutureTimeout:
                                 pass
                             except BaseException:
-                                deferred.append(incoming)
+                                enqueue_input(incoming)
                                 break
                             else:
-                                deferred.append(incoming)
+                                enqueue_input(incoming)
                                 break
                             begin_emergency_exit()
                             raise _EmergencyExit
-                        elif not _async_command(
-                            active_agent, incoming, reinvoke_after_interrupt=False
-                        ):
-                            if incoming.strip():
-                                deferred.append(incoming)
+                        else:
+                            if _is_deferred_host_control(incoming):
+                                with ui.host_output():
+                                    handled = _async_command(
+                                        active_agent, incoming, reinvoke_after_interrupt=False
+                                    )
+                            else:
+                                handled = False
+                            if not handled:
+                                enqueue_input(incoming)
                     if exit_requested:
                         raise _EmergencyExit
                     result = future.result()
             except _EmergencyExit:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 ui.status("已取消活动请求并进入有界退出。")
             except agent_plan_cancelled_type:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 ui.warning("规划已取消；未完成规划没有写入会话。")
             except agent_session_error_type as exc:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 print(f"会话已停止：{exc}", file=sys.stderr)
                 return 3
             except agent_error_type as exc:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 print(f"Agent 错误：{exc}", file=sys.stderr)
+                handle_model_failure(exc)
             except KeyboardInterrupt:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 interrupt_requests += 1
                 if interrupt_requests >= 2:
                     begin_emergency_exit()
@@ -1347,6 +1666,12 @@ def main(argv: list[str] | None = None) -> int:
                     if outcome == "emergency":
                         ui.status("已取消活动请求并进入有界退出。")
                         break
+                    elif outcome == "error" and isinstance(_payload, agent_session_error_type):
+                        print(f"会话已停止：{_payload}", file=sys.stderr)
+                        return 3
+                    elif outcome == "error" and isinstance(_payload, agent_service_error_types):
+                        print(f"Agent 错误：{_payload}", file=sys.stderr)
+                        handle_model_failure(_payload)
                     else:
                         ui.warning("规划已取消；未完成规划没有写入会话。")
                     continue
@@ -1364,8 +1689,12 @@ def main(argv: list[str] | None = None) -> int:
                 outcome, payload = wait_after_main_interrupt()
                 if outcome == "emergency":
                     ui.status("已取消活动请求并进入有界退出。")
+                elif outcome == "error" and isinstance(payload, agent_session_error_type):
+                    print(f"会话已停止：{payload}", file=sys.stderr)
+                    return 3
                 elif outcome == "error" and isinstance(payload, agent_error_type):
                     print(f"Agent 错误：{payload}", file=sys.stderr)
+                    handle_model_failure(payload)
                 elif outcome == "error":
                     print("Agent 错误：重新评估失败。", file=sys.stderr)
                 else:
@@ -1374,17 +1703,25 @@ def main(argv: list[str] | None = None) -> int:
                     ui.text(payload)
             except Exception:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 print("Agent 错误：处理请求失败。", file=sys.stderr)
             else:
                 if streamed:
-                    print()
+                    ui.finish_assistant()
                 else:
                     ui.start_assistant()
                     ui.text(result)
             if exit_requested:
                 break
     finally:
+        with lifecycle_notice_lock:
+            lifecycle_notices_closed.set()
+        if deferred:
+            # Commands already acknowledged as queued must have a visible
+            # terminal state even on EOF, ordinary exit or a session failure.
+            discard_deferred(reason="会话结束")
+        if model_service is not None:
+            model_service.close()
         broker.close()
         close = getattr(client, "close", None)
         if emergency_exit and callable(close):

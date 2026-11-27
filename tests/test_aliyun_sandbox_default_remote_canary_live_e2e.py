@@ -48,6 +48,7 @@ from app.workflow import SessionEventWorkflow
 from app.workspace_checkpoint import create_workspace_checkpoint_initializer
 from app.workspace_seed import WorkspaceSeedEntry, WorkspaceSeedSnapshot
 from tests.sandbox_cleanup_fakes import empty_recovery_provider
+from tests.model_service_helpers import ready_model_service_patch
 from tests.test_remote_mutation_runtime import _Sandbox, _settings
 from tests.test_workspace_versions import _MemoryTransport
 from tool import registry
@@ -475,6 +476,8 @@ def _live_runtime_factory(
         settings: object,
         *,
         collect_orphans: object = False,
+        session_directory: Path | None = None,
+        session_cleanup_complete: bool = False,
     ) -> ExecutionToolRuntime:
         if (
             execution_backend != "aliyun-sandbox"
@@ -482,11 +485,21 @@ def _live_runtime_factory(
             or _SESSION_ID_RE.fullmatch(session_id) is None
             or not isinstance(settings, SandboxSettings)
             or collect_orphans is not True
+            or not isinstance(session_directory, Path)
+            or session_cleanup_complete is not True
         ):
             raise _HarnessError("default remote canary runtime 绑定无效。")
+        from app.sandbox_budget import SandboxBudget
+
         runtime = ExecutionToolRuntime(AliyunSandboxExecutionBackend(
             session_id,
             settings,
+            session_cleanup_complete=session_cleanup_complete,
+            budget=SandboxBudget(
+                settings.max_session_seconds,
+                path=session_directory / "sandbox-budget.json",
+                session_id=session_id,
+            ),
             workspace_initializer=create_workspace_checkpoint_initializer(
                 _canary_snapshot(), collect_orphans=True
             ),
@@ -588,6 +601,7 @@ def _run_default_remote_canary(
                 ),
                 patch.object(main_module, "create_execution_runtime", side_effect=runtime_factory),
                 patch.object(main_module, "create_client", return_value=client),
+                ready_model_service_patch(),
                 patch.object(main_module, "Observability", return_value=observer),
                 patch.object(main_module, "MaintenanceService", return_value=_QuietMaintenance()),
                 patch.object(main_module._InputBroker, "confirm", unexpected_approval),
@@ -658,6 +672,7 @@ def _run_default_remote_canary(
                 patch.object(main_module, "load_sandbox_settings", forbidden_sandbox),
                 patch.object(main_module, "create_execution_runtime", forbidden_runtime),
                 patch.object(main_module, "create_client", forbidden_client),
+                ready_model_service_patch(),
                 patch("app.terminal_input.create_terminal_reader", return_value=_ExitInput()),
                 patch("sys.stdout", io.StringIO()),
                 patch("sys.stderr", io.StringIO()),
@@ -994,13 +1009,19 @@ class DefaultRemoteCanaryHarnessOfflineTests(unittest.TestCase):
                 settings,
                 *,
                 collect_orphans=False,
+                session_directory=None,
+                session_cleanup_complete=False,
             ):
                 if (
                     execution_backend != "aliyun-sandbox"
                     or collect_orphans is not True
                     or settings is not selected_settings
+                    or not isinstance(session_directory, Path)
+                    or session_cleanup_complete is not True
                 ):
                     raise _HarnessError("offline canary runtime 绑定无效。")
+                from app.sandbox_budget import SandboxBudget
+
                 transport = CountingTransport(
                     "/workspace/agnet-study/" + session_id
                 )
@@ -1008,6 +1029,12 @@ class DefaultRemoteCanaryHarnessOfflineTests(unittest.TestCase):
                 runtime = ExecutionToolRuntime(AliyunSandboxExecutionBackend(
                     session_id,
                     settings,
+                    session_cleanup_complete=session_cleanup_complete,
+                    budget=SandboxBudget(
+                        settings.max_session_seconds,
+                        path=session_directory / "sandbox-budget.json",
+                        session_id=session_id,
+                    ),
                     sandbox_factory=lambda _settings, _metadata: sandbox,
                     persistence_sandbox_factory=lambda _settings, _metadata: SimpleNamespace(
                         sandbox_id="offline-canary-persistence",
@@ -1060,8 +1087,8 @@ class DefaultRemoteCanaryHarnessOfflineTests(unittest.TestCase):
             runtime.closed = False
             observed["runtime"] = runtime
 
-            def fail(_backend, session_id, _settings, *, collect_orphans=False):
-                del collect_orphans
+            def fail(_backend, session_id, _settings, *, collect_orphans=False, session_directory=None, session_cleanup_complete=False):
+                del collect_orphans, session_directory, session_cleanup_complete
                 observed["session_id"] = session_id
                 raise RuntimeError("runtime-secret")
 

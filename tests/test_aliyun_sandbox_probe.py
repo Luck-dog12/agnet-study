@@ -74,6 +74,8 @@ class SandboxConfigTests(unittest.TestCase):
         self.assertIsNone(settings.api_key)
         self.assertEqual(settings.oss_mount_dir, "/mnt/oss")
         self.assertEqual(settings.timeout_seconds, 300)
+        self.assertEqual(settings.idle_timeout_seconds, 120)
+        self.assertEqual(settings.max_session_seconds, 3600)
         self.assertEqual(
             settings.runtime_venv_dir,
             "/opt/agnet-study/runtime/venv",
@@ -185,6 +187,31 @@ class SandboxConfigTests(unittest.TestCase):
         self.assertFalse(disabled.allow_internet_access)
         self.assertTrue(enabled.allow_internet_access)
 
+    def test_lifecycle_limits_are_finite_strict_and_environment_overridable(self):
+        settings, _ = self.load(
+            {"ALIYUN_SANDBOX_IDLE_TIMEOUT_SECONDS": "90",
+             "ALIYUN_SANDBOX_MAX_SESSION_SECONDS": "7200"},
+            {"ALIYUN_SANDBOX_MAX_SESSION_SECONDS": "1800"},
+        )
+        self.assertEqual(settings.idle_timeout_seconds, 90)
+        self.assertEqual(settings.max_session_seconds, 1800)
+        for field, lower, upper in (("idle_timeout_seconds", 30, 3600),
+                                    ("max_session_seconds", 60, 86400)):
+            for value in (True, 0, lower - 1, upper + 1, 30.0, "120", None):
+                with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
+                    SandboxSettings(**{field: value})
+            self.assertEqual(getattr(SandboxSettings(**{field: upper}), field), upper)
+        for name in ("ALIYUN_SANDBOX_IDLE_TIMEOUT_SECONDS",
+                     "ALIYUN_SANDBOX_MAX_SESSION_SECONDS"):
+            for value in ("0", "-1", "1.5", "unlimited", ""):
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    self.load({name: value})
+        # A short cloud lease can renew while busy, and a smaller total budget
+        # can truncate the first lease without requiring unrelated settings edits.
+        settings = SandboxSettings(timeout_seconds=300, idle_timeout_seconds=600,
+                                   max_session_seconds=60)
+        self.assertEqual(settings.max_session_seconds, 60)
+
 
 class SandboxProbeTests(unittest.TestCase):
     def test_metadata_contains_stringified_oss_configuration_without_api_key(self):
@@ -233,6 +260,8 @@ class SandboxProbeTests(unittest.TestCase):
                 "api_url": "https://api.cn-hangzhou.e2b.fc.aliyuncs.com",
                 "domain": "cn-hangzhou.e2b.fc.aliyuncs.com",
                 "timeout": 300,
+                "request_timeout": 10,
+                "lifecycle": {"on_timeout": "kill", "auto_resume": False},
                 "metadata": metadata,
                 "allow_internet_access": False,
                 "template": "code-interpreter-v1",

@@ -132,6 +132,11 @@ class SessionLeaseTests(unittest.TestCase):
 
 
 class SessionCliTests(unittest.TestCase):
+    def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
+
     def test_new_explicit_and_generated_names_are_unique(self):
         from app import main as main_module
 

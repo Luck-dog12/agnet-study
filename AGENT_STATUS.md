@@ -1,6 +1,44 @@
 # Coding Agent 构建状态与新会话交接
 
-> 最后核对日期：2026-10-23  
+2026-11-27 沙箱状态接口验收与 CI/CD：固定生产 Canary 的三道真实云门禁全部通过，安全摘要为 `status=success`、`exit_code=0`、`completed_gates=3`，其中 OSS RAM prefix 最小权限、双 Sandbox 安全边界、默认 remote 新会话与显式 local 回滚均为 `passed`。随后在既有真实云 CodingAgent A→B 恢复及运行中取消用例中补充 `get_status()` 断言，两项均通过，耗时 **104.470 秒**：初始空闲、审批等待、远端 handle 绑定时运行中、完成轮与后台任务统计、跨实例恢复后的最近轮次、取消后的迟到结果仍保持 cancelled，以及关闭后 stopped 均一致。用例使用受控模型脚本和真实云 SDK/执行/OSS，保留宿主未被修改、精确清理和 provider `active=0` 的原验收条件；不能把这些结果描述为真实模型自主规划云任务，也未重新验证空闲回收和续期的所有真实时序。
+
+新增 GitHub Actions 配置：CI 在 main、codex 分支、PR 或手动入口运行 Windows/Ubuntu × Python 3.11/3.13 四组合，均创建并使用项目 `.venv`，执行离线 unittest、编译和依赖检查；通过后提供同一提交的源码 ZIP 与 SHA-256 校验文件。真实模型和云门禁保持关闭，不读取云 Secrets。CD 在 `v*` 标签触发，复用同标签提交的完整 CI，校验标签与项目版本后发布 GitHub Releases 源码包；保留运行所需的 code.md、工具策略和 Skills，不冒充可独立运行的 wheel，也不配置未知服务器部署。Action 固定完整提交 SHA，发布写权限仅限发布任务，不覆盖已有 Release。操作说明见 `docs/CI_CD.md`。
+
+提交前本地验证：使用与 CI 一致的离线环境开关，全量 **958 项：933 通过、25 跳过，耗时 30.433 秒**；`compileall -q app tool tests scripts`、`pip check`、`git diff --check` 通过。25 项跳过包含新增的 3 项显式真实模型状态门禁。提交候选文件检查未发现当前配置中的真实密钥，`.env` 和运行会话仍被 Git 忽略。云端 Actions 结果应以仓库实际运行记录为准。
+
+2026-11-27 统一状态查询真实验证：新增默认关闭的 `tests/test_agent_status_live_e2e.py`，仅 `RUN_AGENT_STATUS_LIVE_E2E=1` 时调用配置的真实模型。使用 `deepseek-v4-flash` 完成 **3/3 项，通过，耗时 11.603 秒、5 次真实请求**：真实流式文本经历 `idle → running → idle`，最近轮次为 `completed`，关闭后为 `stopped`（1 次请求、1.673 秒）；收到真实文本后主动停止，最终保持 `stopped`、没有伪造完成轮或自动续请求（1 次请求、1.538 秒）；模型实际调用本地受限 `code_interpreter`，固定表达式 `sum(range(10))` 返回 `45`，后台任务统计为 1 个 completed、0 个 active，真实持久事件前缀投影依次为 `accepted → running → completed`（3 次请求、8.387 秒）。另外既有真实模型连通性测试 1/1 项通过，耗时 5.356 秒。
+
+本次观测范围：真实轮询捕捉到 `running`，流式回调也验证运行状态；短计算未被现场轮询捕捉到 `waiting_async`，因此该阶段仍以既有离线测试为依据，不将事件回放冒充现场观测。测试使用内存会话、临时工具日志、真实 SDK 响应与真实本地工具；请求适配器限制为 60 秒超时、零重试、每次最多 512 输出 token，并在首个工具请求指定唯一允许的计算工具，派发前精确核对固定代码。返回结果和模型响应均未伪造，其他工具在执行前被阻断。没有创建云 Sandbox，也没有执行真实云审批或恢复测试。此轮没有修改生产逻辑；真实用例的默认关闭检查与编译检查均通过。
+
+2026-11-26 统一状态查询：新增 `app/agent_status.py` 的不可变状态快照与纯事件投影，宿主通过 `CodingAgent.get_status()` 查询 `run_state`、`mode`、当前/最近持久轮次、后台任务元数据与统计、待核验数量和 `last_event_seq`，可用 `model_dump(mode="json")` 转为 JSON 数据。前台阶段包含 `idle`、`running`、`waiting_approval`、`waiting_plan`、`waiting_async`、`stopped`、`failed`；主动关闭与会话故障分别标识，普通单轮错误仍可返回空闲接收下一请求。终端 `/status` 已移除独立维护的运行阶段，改用统一接口；Agent 尚未初始化时使用同一事件投影，保留模型、队列与沙箱信息。
+
+查询只读已有内存事件快照，不调用模型、不创建沙箱、不刷新事件、不获取后台任务执行锁，也不返回请求、结果或错误正文。最近轮次的 `completed` 只表示该轮回复结束，不代表目标已验收；前台空闲时后台任务仍可能运行，需同时查看 `task_counts.active`。Plan 成功前没有持久轮次，取消 Plan 不改写最近轮次；`/interrupt` 继续保持中断后重新评估的行为。恢复未知结果和取消后迟到结果沿用已有事件语义，尚未提交的进度可能稍有延迟。
+
+2026-11-26 验证：新增 12 项状态测试覆盖运行/结束、普通错误与会话故障、审批/Plan/异步等待、中断续跑、停止、恢复、迟到结果、只读与不可变性、任务锁被占用时查询，以及 CLI 统一接线与延迟初始化。项目 `.venv` 中定向 **84 项通过**；统一 UTF-8 并关闭全部 `RUN_*` live 门禁后，全量 **955 项：933 通过、22 跳过，耗时 41.118 秒**。`compileall -q app tool tests`、`pip check` 和 `git diff --check` 均通过；独立 API 检查也确认初始空闲、完成后空闲、主动停止及查询不触发执行。本轮没有调用真实模型或创建真实云资源。使用示例已写入 README。
+
+2026-11-08 云沙箱生命周期与成本时长控制：在既有 execution/persistence 双实例隔离上，新增默认 **120 秒空闲回收、300 秒云端租期、3600 秒同会话累计驻留上限**。首次远端工具仍按需创建；普通空闲回收同时销毁两实例，下次新的工具操作重新创建并从 OSS 恢复已提交工作区，不重放旧用户命令。审批 reservation、待派发 capability 和异步 handle 等待期间均保留活动占用；续期受累计额度约束，初始化阶段不续期且必须在首个租期内完成。达到硬上限、租期过期、续期失败或无法确认安全清理时，阻断远端执行并拒绝迟到结果，不自动退回本机执行。
+
+预算记录：新增 `app/sandbox_budget.py`，CLI 将 `sandbox-budget.json` 绑定持久会话目录；创建/续期前保存最坏租期预留，含有界网络请求余量。确认清理后按驻留时间结算；创建响应丢失或销毁未知时保守计入完整预留，重启/恢复不清零。独立 OS 文件锁、原子写入、会话身份和 owner 校验防止旧进程结算覆盖后继账本；损坏、路径不安全或写入失败均禁止新增云资源和续期。会话存储精确允许预算账本、锁和规定格式的遗留临时文件，并保留普通文件安全校验与未知文件拒绝。这里统计的是一组双实例的驻留时间，不是两个实例时长之和，也不是金额或账号级总预算；OSS 费用独立存在。
+
+资源隔离与终端：每次创建的实例组拥有独立 generation metadata，故障/退出的独立清理只针对该组，旧进程迟到清理不能误删后继组。CLI 在持有会话 writer lock 时先完成全会话残留清理，交给 Agent 后的 lazy 创建与空闲重建不再进行全会话扫描。SDK 创建显式指定到期销毁、关闭自动恢复及请求超时。`/status` 显示沙箱状态、已用/剩余时间和限制；未初始化时不会为了状态查询创建资源或接管账本。生命周期通知与流式终端输出同步，退出后停止通知；没有新增手动解锁命令。配置及限制见 `docs/SANDBOX_LIFECYCLE.md` 和 `.env.example`。
+
+2026-11-08 验证：新增预算、生命周期、CLI 和会话恢复离线测试覆盖空闲销毁/OSS 恢复、审批及异步任务占用、有限续期与网络余量、超限迟到结果拒绝、未知创建保守预留、跨进程账本接管及跨实例组清理隔离。项目 `.venv` 中统一 UTF-8 并显式关闭全部 live 门禁，全量 **943 项：921 通过、22 跳过，耗时 47.921 秒**；`compileall -q app tool tests`、`pip check` 均通过。本轮未调用真实模型或创建真实云资源；真实 provider 续期/回收及账单效果尚未进行本轮 live 验证。
+
+2026-11-04 待执行命令可见性修复：普通 act 执行期间收到的新需求仍按 FIFO 排队，现在立即显示“已排队 #编号：需求预览”和完整待执行列表；轮到该需求时显示“开始执行 #编号”并更新剩余列表。编号在当前进程内递增，排队提示只属于终端呈现，未轮到的需求不提前写入 `user/message` 或提交模型，实际执行保留完整原文。运行中 `/status` 立即返回运行状态、等待数量和列表；审批回复与 Plan 选择不进入普通命令队列。模型服务失败时列出已取消的排队命令，故障期间的新输入继续直接丢弃；工具轮次上限不清空队列。退出或会话停止也为剩余队列显示取消结果。
+
+终端显示同步：队列通知与模型输出按块串行，通知前结束当前输出行，后续模型文本重新显示回复前缀；默认输出动态使用终端的 stdout/stderr 代理，避免绕过 prompt_toolkit 重绘。命令预览转义换行、控制字符和 Unicode 行分隔符，并限制显示长度，完整需求内容不受影响。新增 `tests/test_command_queue.py` 的 8 项测试覆盖连续入队可见性、FIFO 精确执行、实时状态、故障取消不重放、工具上限后执行排队需求、审批状态查询不冒充审批、退出取消、文本显示边界与终端输出代理。
+
+2026-11-04 验证：上述 8 项离线场景通过；旧工具轮次上限测试改为等待“重新尝试”的 Future 完成再发送退出，避免把主动退出导致的队列取消误判为重试失败。项目 `.venv` 中统一 UTF-8、显式关闭全部 live 门禁后，全量 **902 项：880 通过、22 跳过，耗时 32.711 秒**；`compileall -q app tool tests`、`pip check`、`git diff --check` 均通过。本轮没有调用真实模型或云 Sandbox。
+
+2026-11-02 模型故障处理修正：按用户要求撤销此前的手动 `/model reset` 和持久暂停锁，改为交互启动时先检查模型服务。独立后台检查对当前配置的模型发送一个无历史、无工具的小请求，SDK 超时设为 10 秒、禁用 SDK 重试、关闭 thinking、最多 16 个输出 token，不初始化 Agent 或 Sandbox。检查中或不可用时不接受用户需求；检查失败提示“模型服务失败”，每隔 15 秒自动重查，健康时不持续轮询。`--help` 和 `--list-sessions` 不启动检查，退出不等待检查网络请求。
+
+输入与恢复：故障期间提交的普通输入原文在进入输入队列前即被替换为丢弃标记，不追加 `user/message`，也不交给模型；已经排队但未执行的需求在发生模型故障时清空。自动检查成功后提示服务可用，只接收新提交的需求，不重放旧任务；用户无需输入恢复命令。输入边界以完整行提交时的状态为准，避免吞掉等待恢复后提交的第一条新命令。`/status` 显示 `model_state=checking|unavailable|ready`。已有运行实例中仍可用 `/tasks`、`/task ID`、`/cancel ID` 和 `/recovery` 管理已派发任务，退出始终可用。
+
+错误分类与历史：仅模型请求失败或模型响应协议错误进入服务不可用状态；截图中的“工具调用超过最大轮次”属于任务上限，保留任务上下文，下一条“重新尝试”可正常执行。模型失败轮的原始需求保留在不可变审计记录中，但从后续 SDK 消息中隔离；失败的中断重评估链同样撤销原始未完成需求。已发生的 assistant/tool 配对、工具结果及未知修改核验规则保留，旧 assistant 文本与推理不再作为继续执行依据；包含撤销轮的自由摘要回退到事实投影。失败 Plan 不写用户需求或暂停事件。旧版本留下的 `model_guard` 控制事件仅作为审计记录，不会继续锁住会话或传给模型。后台任务继续记录真实终态，已执行操作不自动回滚。普通模型请求原有重试配置、权限与执行后端保持不变。
+
+2026-11-02 验证：在项目 `.venv` 中使用 Fake client、受控健康检查和受控 runner，覆盖启动失败、故障期输入丢弃、自动恢复后的第一条新命令、旧排队命令清除、迟到检查结果、检查中退出、工具轮次上限正常重试、失败历史隔离及后台任务真实终态。既有 CLI 测试显式替换健康检查，模型探测另有独立测试；本轮不调用真实 DeepSeek 或云 Sandbox。统一 UTF-8 并显式关闭全部 live 门禁后，定向 **84 项通过**，全量发现 **894 项：872 通过、22 跳过，耗时 36.007 秒**；`compileall -q app tool tests`、`pip check` 和 `git diff --check` 均通过。
+
+> 最后核对日期：2026-11-27<br>
 > 项目根目录：`F:\新项目\agnet-study`  
 > 当前阶段：在既有单 Agent、会话、权限、审批、异步任务和 Sandbox/OSS 基线上，已完成 **5C1 + 5C2 + 5C3 + 5C4 + 5C5** 的产品接线，并于 2026-10-14 第十次 5C6 真实云运行打通 partial-control 核心 Coding Agent 闭环，第十一次又在同一 A→B 流程中通过 `full-access` 无回调写入/编辑与持久化恢复；随后独立 5C4 live 用例先后通过真实运行中取消、真实结构化超时、“已派发且真实 handle 已绑定后，等待结果不可确认”、“provider 已返回 raw handle、但绑定前包装失败”，以及“provider kill 已成功但成功确认丢失”的安全受控注入。2026-10-15 又完成安全 GC 第一阶段：只有 manifest 写入明确失败、探测明确不存在且 active 已精确回滚时，才会删除本事务确认新建并逐字节复核的 content object；该路径已由真实 CodingAgent 和真实 OSS 删除通过。同日完成两步迁移开关收敛：恢复会话省略 `--execution-backend` 时采用经严格验证的持久绑定；尚未建立身份的新会话可由 `AGENT_DEFAULT_EXECUTION_BACKEND` 选择默认 local/remote，显式 CLI 仍优先且可回滚。已有会话永远不受新默认影响，竞态出现相反绑定会 fail closed，远端配置失败也绝不降级到 local。安装缺省仍为 local，因此本地受限执行尚未下线。此前七个 execution Sandbox、三次 orphan-cleanup Sandbox、maintenance A/B 两个 Sandbox、跨进程 stale 接管 Sandbox、2026-10-19 资源压力 Sandbox、2026-10-20 审批并发 Sandbox、4 个默认 remote canary Sandbox 与 3 个 kill 异常 harness Sandbox 均在结束后由 provider active-list 外部确认对应 session 的 `RUNNING/PAUSED` 数量为 0。固定可信 Linux venv、Agent 远端异步 unittest、`write_file` / `editor_file` 精确事务、统一 remote workspace transaction gate，以及 OSS v2/v3 immutable generation 的恢复链均已完成产品接线。local 路径保持原行为，remote 不会 fallback 到宿主，也不会写宿主 `data/pending`；Agent-facing 删除、清空和自由 shell 仍保持关闭。**截至 2026-10-20，`format_json` v3 提交/恢复/随机 staging 清理、direct-kill=False 与受控真实 SDK/transport kill 异常后的真实 provider 独立 cleaner、sealed-secret provider 前硬门、崩溃 orphan 的真实 OSS 引用扫描精确回收、控制面退出后的跨 OS 进程 stale Sandbox 接管、内存/CPU/墙钟/输出上限压力、审批并发串行化与精确绑定，以及默认 remote 新会话金丝雀、显式 local 回滚与固定三会话 fail-fast 批次均已通过显式授权 live 验收。两个观测时点累计 4/4 canary 成功且 4/4 active=0；这仍不代表长期配额、持续流量或未受控 provider 服务端故障已稳定。**
 
@@ -287,9 +325,9 @@ agent --resume remote-a --execution-backend aliyun-sandbox   # 可显式约束�
 
 权限模式默认 `partial-control`，不会从模型工具参数、提示词或会话消息读取。空闲主提示符输入 `/permissions` 可查看当前模式和风险；`/permissions partial-control` 立即降级，`/permissions full-access` 必须通过同一 input broker 再次明确输入 `yes` 才提权。切换只影响后续新调用，不追溯正在执行的调用；重启后仍以 `--permission-mode` 为准。
 
-Windows PowerShell 出于安全原因不会自动搜索当前目录，因此在**未激活**虚拟环境的 PowerShell 中，根目录的启动方式是 `.\agent.cmd` 或 `.\agent.ps1`，不能写成裸 `agent`。传统 CMD 会搜索当前目录，可以直接执行 `agent`。Ubuntu/POSIX 可在建立 `.venv` 后使用 `./agent.sh`。启动器只使用项目 `.venv`，不会写入用户/系统 PATH，也不会修改 shell 配置。导入入口、查看帮助和列出会话都不会导入 OpenAI SDK；正常交互会先显示 CLI，再在第一条模型请求时创建客户端。
+Windows PowerShell 出于安全原因不会自动搜索当前目录，因此在**未激活**虚拟环境的 PowerShell 中，根目录的启动方式是 `.\agent.cmd` 或 `.\agent.ps1`，不能写成裸 `agent`。传统 CMD 会搜索当前目录，可以直接执行 `agent`。Ubuntu/POSIX 可在建立 `.venv` 后使用 `./agent.sh`。启动器只使用项目 `.venv`，不会写入用户/系统 PATH，也不会修改 shell 配置。导入入口、查看帮助和列出会话都不会导入 OpenAI SDK；正常交互先显示 CLI，后台模型服务检查会加载 SDK 和独立客户端，通过后才接受需求，Agent 与工具运行时仍按需初始化。
 
-本轮 Windows 主机的 5 次离线进程基准：`import app.main` 平均约 116 ms（此前约 1.17 s），`--help` 平均约 126 ms，临时新会话启动并立即 `exit` 平均约 316 ms，且断言 `openai` 未进入 `sys.modules`。这是当前机器的相对诊断值，不是跨机器性能承诺；首个真实模型请求仍需支付 OpenAI SDK 导入、客户端和 Agent 初始化成本。
+此前 Windows 主机的 5 次离线进程基准：`import app.main` 平均约 116 ms（此前约 1.17 s），`--help` 平均约 126 ms，临时新会话启动并立即 `exit` 平均约 316 ms。这些数值早于启动服务检查，不能作为新版交互启动基准；新版仅保留导入/帮助/列举会话不加载 OpenAI SDK，以及检查中退出不等待网络的保证。
 
 | 变量 | 必填 | 默认值 |
 | --- | --- | --- |

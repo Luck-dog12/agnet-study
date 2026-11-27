@@ -48,6 +48,8 @@ SANDBOX_ENV_NAMES: Final[tuple[str, ...]] = (
     "E2B_DOMAIN",
     "E2B_TEMPLATE",
     "ALIYUN_SANDBOX_TIMEOUT_SECONDS",
+    "ALIYUN_SANDBOX_IDLE_TIMEOUT_SECONDS",
+    "ALIYUN_SANDBOX_MAX_SESSION_SECONDS",
     "ALIYUN_SANDBOX_RUNTIME_VENV_DIR",
     "ALIYUN_SANDBOX_RUNTIME_USER",
     "ALIYUN_OSS_BUCKET",
@@ -120,6 +122,8 @@ class SandboxSettings(BaseModel):
     domain: StrictStr | None = None
     template: StrictStr | None = None
     timeout_seconds: StrictInt = 300
+    idle_timeout_seconds: StrictInt = 120
+    max_session_seconds: StrictInt = 3600
     runtime_venv_dir: StrictStr = "/opt/agnet-study/runtime/venv"
     runtime_user: StrictStr = "user"
     oss_bucket: StrictStr | None = None
@@ -184,6 +188,20 @@ class SandboxSettings(BaseModel):
     def validate_timeout(cls, value: int) -> int:
         if not 30 <= value <= 3600:
             raise ValueError("ALIYUN_SANDBOX_TIMEOUT_SECONDS 必须在 30..3600 之间。")
+        return value
+
+    @field_validator("idle_timeout_seconds")
+    @classmethod
+    def validate_idle_timeout(cls, value: int) -> int:
+        if not 30 <= value <= 3600:
+            raise ValueError("ALIYUN_SANDBOX_IDLE_TIMEOUT_SECONDS 必须在 30..3600 之间。")
+        return value
+
+    @field_validator("max_session_seconds")
+    @classmethod
+    def validate_max_session(cls, value: int) -> int:
+        if not 60 <= value <= 86400:
+            raise ValueError("ALIYUN_SANDBOX_MAX_SESSION_SECONDS 必须在 60..86400 之间。")
         return value
 
     @field_validator("runtime_venv_dir")
@@ -372,6 +390,8 @@ def load_sandbox_settings() -> SandboxSettings:
         domain=read_optional("E2B_DOMAIN"),
         template=read_optional("E2B_TEMPLATE"),
         timeout_seconds=read_integer("ALIYUN_SANDBOX_TIMEOUT_SECONDS", 300),
+        idle_timeout_seconds=read_integer("ALIYUN_SANDBOX_IDLE_TIMEOUT_SECONDS", 120),
+        max_session_seconds=read_integer("ALIYUN_SANDBOX_MAX_SESSION_SECONDS", 3600),
         runtime_venv_dir=read_value(
             "ALIYUN_SANDBOX_RUNTIME_VENV_DIR",
             "/opt/agnet-study/runtime/venv",

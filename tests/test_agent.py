@@ -124,12 +124,21 @@ class FakeClient:
 
 
 class AgentTests(unittest.TestCase):
+    def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
+
     def agent(self, responses, **kwargs):
         client = FakeClient(responses)
         settings = Settings(api_key="fake-key", model="fake-model")
         kwargs.setdefault("observability", Mock(spec=Observability))
         kwargs.setdefault("session_workflow", SessionEventWorkflow.in_memory())
-        return CodingAgent(client, settings, **kwargs), client
+        # These tests assert the conversation protocol, independently of local
+        # user-installed Skills. Skill catalog injection has its own suite.
+        with patch("app.agent.build_skill_catalog_message", return_value=None):
+            agent = CodingAgent(client, settings, **kwargs)
+        return agent, client
 
     def test_direct_final_text_is_returned_and_history_is_kept(self):
         agent, client = self.agent([reply(content="已完成项目检查。", reasoning="保留")])
@@ -348,7 +357,8 @@ class AgentTests(unittest.TestCase):
             agent.run("测试中断流", on_text_delta=deltas.append)
         self.assertNotIn("SENSITIVE", str(caught.exception))
         self.assertEqual(deltas, ["已收到一半"])
-        self.assertEqual([message.role for message in agent.messages], ["system", "user"])
+        self.assertEqual([message.role for message in agent.messages], ["system", "system"])
+        self.assertNotIn("测试中断流", str(agent.to_sdk_messages()))
         self.assertEqual(
             [event.type for event in agent.session_events],
             [
@@ -536,8 +546,9 @@ class AgentTests(unittest.TestCase):
                 agent, _ = self.agent([reply(content=content)])
                 with self.assertRaises(AgentProtocolError):
                     agent.ask("执行任务")
-                # 无效 SDK 回复不能表示为内部 AssistantMessage，因此不会污染历史。
-                self.assertEqual([item.role for item in agent.messages], ["system", "user"])
+                # 无效回答和失败需求均不进入可执行上下文，保留固定撤销说明。
+                self.assertEqual([item.role for item in agent.messages], ["system", "system"])
+                self.assertNotIn("执行任务", str(agent.to_sdk_messages()))
 
     @patch("app.agent.call_tool")
     def test_multiple_tools_execute_and_full_order_is_sent_back(self, mocked_call):
@@ -681,7 +692,10 @@ class AgentTests(unittest.TestCase):
         ], confirmation_callback=callback, observability=observer)
         self.assertEqual(agent.run("删除文件"), "操作未执行。")
         mocked_call.assert_called_once()
-        self.assertIs(mocked_call.call_args.kwargs["confirmation_callback"], callback)
+        forwarded = mocked_call.call_args.kwargs["confirmation_callback"]
+        request = object()
+        self.assertIs(forwarded(request), True)
+        callback.assert_called_once_with(request)
         self.assertIs(mocked_call.call_args.kwargs["observability"], observer)
 
     def test_cli_confirmation_only_accepts_explicit_yes(self):

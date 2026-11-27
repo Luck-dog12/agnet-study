@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ValidationError
 
 from app.config import Settings
+from app.agent_status import AgentMode, AgentStatus, RunPhase, project_agent_status
 from app.permissions import (
     DEFAULT_PERMISSION_MODE,
     PermissionMode,
@@ -85,6 +87,7 @@ from app.workflow import (
     FileApprovalWorkflow,
     SessionEventError,
     SessionEventWorkflow,
+    ToolConfirmationRequest,
     assistant_message_snapshot,
     canonical_json_snapshot,
     tool_call_snapshot,
@@ -119,6 +122,10 @@ class AgentError(RuntimeError):
 
 class AgentProtocolError(AgentError):
     """模型或工具返回了不符合内部消息协议的数据。"""
+
+
+class AgentModelProtocolError(AgentProtocolError):
+    """The model response/stream failed validation, rather than a local tool."""
 
 
 class AgentLoopLimitError(AgentError):
@@ -550,6 +557,11 @@ class CodingAgent:
         self._plan_clarification_callback = plan_clarification_callback
         self._workflow = workflow if workflow is not None else FileApprovalWorkflow()
         self._failed = False
+        self._status_lock = Lock()
+        self._status_phase: RunPhase = "idle"
+        self._status_mode: AgentMode | None = None
+        self._status_stopped = False
+        self._status_faulted = False
         self._run_lock = Lock()
         self._generation_lock = RLock()
         self._generation = 0
@@ -630,6 +642,60 @@ class CodingAgent:
                 self._session.close()
             raise AgentSessionError("会话上下文无法安全恢复。") from None
 
+    def get_status(self) -> AgentStatus:
+        """Return a detached immutable host snapshot without I/O or worker locks.
+
+        Phase flags describe this process; task/turn/recovery facts describe one
+        committed event prefix. Queued events are not flushed for this query.
+        """
+        with self._status_lock:
+            phase, mode = self._status_phase, self._status_mode
+            failed, stopped = self._status_faulted, self._status_stopped
+            events = self._session.events
+        return project_agent_status(
+            self._session.session_id, events, phase=phase, mode=mode,
+            failed=failed, stopped=stopped,
+        )
+
+    def _mark_failed(self) -> None:
+        with self._status_lock:
+            if not self._status_stopped:
+                self._status_faulted = True
+            self._failed = True
+
+    def _mark_stopped(self) -> None:
+        with self._status_lock:
+            self._status_stopped = True
+            self._failed = True
+
+    def _begin_status_run(self, mode: AgentMode) -> None:
+        with self._status_lock:
+            if self._failed:
+                raise AgentSessionError("会话已停止，拒绝启动新的请求。")
+            self._status_phase = "running"
+            self._status_mode = mode
+
+    def _end_status_run(self) -> None:
+        with self._status_lock:
+            self._status_phase = "idle"
+            self._status_mode = None
+
+    @contextmanager
+    def _status_wait(self, phase: RunPhase) -> Iterator[None]:
+        with self._status_lock:
+            previous = self._status_phase
+            self._status_phase = phase
+        try:
+            yield
+        finally:
+            with self._status_lock:
+                self._status_phase = previous
+
+    def _confirm_tool(self, request: ToolConfirmationRequest) -> bool:
+        assert self._confirmation_callback is not None
+        with self._status_wait("waiting_approval"):
+            return self._confirmation_callback(request)
+
     @property
     def messages(self) -> tuple[Message, ...]:
         """返回事件投影的只读快照。"""
@@ -682,7 +748,7 @@ class CodingAgent:
                 allow_incomplete_tool_tail=True,
             ))
         except SessionEventError:
-            self._failed = True
+            self._mark_failed()
             raise AgentSessionError("会话上下文无法安全重建。") from None
 
     def _commit(self, event_type: str, data: BaseModel) -> SessionEvent:
@@ -693,7 +759,7 @@ class CodingAgent:
             self._refresh_messages()
             return event
         except (SessionEventError, EventQueueError):
-            self._failed = True
+            self._mark_failed()
             raise AgentSessionError("会话事件无法可靠保存，当前工作流已停止。") from None
 
     def _commit_batch(
@@ -706,7 +772,7 @@ class CodingAgent:
             self._refresh_messages()
             return events
         except (SessionEventError, EventQueueError):
-            self._failed = True
+            self._mark_failed()
             raise AgentSessionError("会话事件批次无法可靠保存，当前工作流已停止。") from None
 
     def _commit_tool_result(
@@ -764,7 +830,7 @@ class CodingAgent:
             )
             self._refresh_messages()
         except (SessionEventError, EventQueueError):
-            self._failed = True
+            self._mark_failed()
             raise AgentSessionError("会话摘要无法可靠保存。") from None
 
     def ask(self, prompt: str, *, on_text_delta: StreamCallback | None = None) -> str:
@@ -773,6 +839,7 @@ class CodingAgent:
         if not self._run_lock.acquire(blocking=False):
             raise AgentError("已有一轮会话正在执行。")
         try:
+            self._begin_status_run("act")
             next_prompt = prompt
             while True:
                 try:
@@ -788,17 +855,22 @@ class CodingAgent:
                     continue
                 return answer
         except AgentSessionError:
-            self._failed = True
+            self._mark_failed()
+            raise
+        except (AgentRequestError, AgentProtocolError, AgentLoopLimitError):
+            # Known failures already closed their turn. Crash recovery would
+            # falsely terminate live tasks whose real result can still arrive.
             raise
         except BaseException:
             try:
                 self._session.recover_incomplete()
                 self._refresh_messages()
             except SessionEventError:
-                self._failed = True
+                self._mark_failed()
                 raise AgentSessionError("中断状态无法可靠保存，请重新启动恢复会话。") from None
             raise
         finally:
+            self._end_status_run()
             self._run_lock.release()
 
     def _ask(self, prompt: str, *, on_text_delta: StreamCallback | None = None) -> str:
@@ -823,11 +895,17 @@ class CodingAgent:
             try:
                 collected = self._request_model(on_text_delta, snapshots)
                 assistant = _parse_assistant_message(collected.message)
-            except (AgentProtocolError, AgentRequestError):
+                if not assistant.tool_calls and (
+                    not isinstance(assistant.content, str) or not assistant.content.strip()
+                ):
+                    raise AgentModelProtocolError("模型最终回复缺少有效文本。")
+            except (AgentProtocolError, AgentRequestError) as error:
                 self._commit("assistant/attempt", AssistantAttemptEventData(
                     turn_id=turn_id, step=step, stream=tuple(snapshots), kind="error"
                 ))
                 self._finish_boundaries(turn_id, step, "error")
+                if isinstance(error, AgentProtocolError):
+                    raise AgentModelProtocolError(str(error)) from None
                 raise
             except AgentInterruptedError:
                 self._commit("assistant/attempt", AssistantAttemptEventData(
@@ -853,9 +931,6 @@ class CodingAgent:
             )
 
             if not assistant.tool_calls:
-                if not isinstance(assistant.content, str) or not assistant.content.strip():
-                    self._finish_boundaries(turn_id, step, "error")
-                    raise AgentProtocolError("模型最终回复缺少有效文本。")
                 active_tasks, unseen_terminal = self._turn_async_followup_state(
                     turn_id, after_seq=request_context_seq
                 )
@@ -869,9 +944,10 @@ class CodingAgent:
                     ),
                 )
                 if active_tasks:
-                    self._wait_for_turn_async_tasks(
-                        turn_id, urgent_after_seq=waiting_boundary.seq
-                    )
+                    with self._status_wait("waiting_async"):
+                        self._wait_for_turn_async_tasks(
+                            turn_id, urgent_after_seq=waiting_boundary.seq
+                        )
                 if on_text_delta is not None:
                     on_text_delta("\n")
                 step += 1
@@ -928,7 +1004,7 @@ class CodingAgent:
                         )
                         prepared = prepare_async_tool_call(
                             tool_call,
-                            confirmation_callback=self._confirmation_callback,
+                            confirmation_callback=(self._confirm_tool if self._confirmation_callback is not None else None),
                             workflow=self._workflow,
                             observability=self._observability,
                             permission_mode=self.permission_mode,
@@ -970,7 +1046,7 @@ class CodingAgent:
                             prepared.cancel_hook()
                         except Exception:
                             pass
-                        self._failed = True
+                        self._mark_failed()
                         raise AgentSessionError(
                             "后台任务接受事件无法可靠保存，任务没有启动。"
                         ) from None
@@ -1033,7 +1109,7 @@ class CodingAgent:
                     )
                     raw_result = call_tool(
                         tool_call,
-                        confirmation_callback=self._confirmation_callback,
+                        confirmation_callback=(self._confirm_tool if self._confirmation_callback is not None else None),
                         workflow=self._workflow,
                         observability=self._observability,
                         async_task_manager=self._tasks,
@@ -1158,6 +1234,7 @@ class CodingAgent:
         if not self._run_lock.acquire(blocking=False):
             raise AgentError("已有一轮会话正在执行。")
         try:
+            self._begin_status_run("plan")
             request_prompt = build_plan_request_prompt(prompt)
             planning_messages = self._request_context_messages()
             planning_messages.append({"role": "user", "content": request_prompt})
@@ -1198,6 +1275,8 @@ class CodingAgent:
                             {"role": "user", "content": build_plan_protocol_correction()}
                         )
                         continue
+                except AgentProtocolError as error:
+                    raise AgentModelProtocolError(str(error)) from None
                 except AgentInterruptedError:
                     raise AgentPlanCancelledError("规划已取消，未写入会话。") from None
                 except KeyboardInterrupt:
@@ -1216,7 +1295,7 @@ class CodingAgent:
                     question.id in seen_question_ids
                     or normalized_question in seen_question_texts
                 ):
-                    raise AgentProtocolError("计划模式重复返回同一澄清问题。")
+                    raise AgentModelProtocolError("计划模式重复返回同一澄清问题。")
                 if len(answers) >= self._max_plan_clarifications:
                     raise AgentLoopLimitError("计划澄清超过最大轮次，未写入会话。")
                 if self._plan_clarification_callback is None:
@@ -1224,7 +1303,8 @@ class CodingAgent:
                 seen_question_ids.add(question.id)
                 seen_question_texts.add(normalized_question)
                 try:
-                    selected_index = self._plan_clarification_callback(question)
+                    with self._status_wait("waiting_plan"):
+                        selected_index = self._plan_clarification_callback(question)
                 except (EOFError, KeyboardInterrupt):
                     selected_index = None
                 if selected_index is None:
@@ -1278,9 +1358,10 @@ class CodingAgent:
                     on_text_delta(chunk)
             return rendered
         except AgentSessionError:
-            self._failed = True
+            self._mark_failed()
             raise
         finally:
+            self._end_status_run()
             self._run_lock.release()
 
     def _request_model(
@@ -1343,8 +1424,8 @@ class CodingAgent:
             return collected
         except AgentInterruptedError:
             raise
-        except AgentProtocolError:
-            raise
+        except AgentProtocolError as error:
+            raise AgentModelProtocolError(str(error)) from None
         except Exception as error:
             category = _classify_request_error(error)
             raise AgentRequestError(_REQUEST_ERROR_MESSAGES[category]) from None
@@ -1366,7 +1447,7 @@ class CodingAgent:
 
     def cancel_for_shutdown(self) -> None:
         """不追加会话事件；只阻止新工作并关闭当前流。"""
-        self._failed = True
+        self._mark_stopped()
         self._cancel_active_generation(wait=False)
 
     def _cancel_active_generation(self, *, wait: bool = True) -> None:
@@ -1401,7 +1482,7 @@ class CodingAgent:
             self._refresh_messages()
             return event
         except EventQueueError:
-            self._failed = True
+            self._mark_failed()
             raise AgentSessionError("紧急事件无法可靠保存，会话已停止。") from None
 
     def list_async_tasks(self) -> tuple[AsyncTaskSnapshot, ...]:
@@ -1438,7 +1519,7 @@ class CodingAgent:
         )
 
     def close(self, *, wait: bool = True) -> None:
-        self._failed = True
+        self._mark_stopped()
         runtime = self._execution_runtime
         fence_error: BaseException | None = None
         if runtime is not None:

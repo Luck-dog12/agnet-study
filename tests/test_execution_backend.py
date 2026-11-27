@@ -33,10 +33,13 @@ from app.sandbox_config import SandboxProbeDisabledError, SandboxSettings
 from tests.sandbox_cleanup_fakes import (
     empty_recovery_provider,
 )
-from app.aliyun_sandbox_session_cleanup import SandboxRecoveryPage
+from app.aliyun_sandbox_session_cleanup import (
+    SandboxRecoveryPage, SANDBOX_GENERATION_METADATA_KEY,
+)
 
 
 def AliyunSandboxExecutionBackend(*args, **kwargs):
+    kwargs.setdefault("automatic_maintenance", False)
     kwargs.setdefault("recovery_provider", empty_recovery_provider())
     if (
         "sandbox_factory" in kwargs
@@ -221,8 +224,10 @@ class ExecutionBackendTests(unittest.TestCase):
 
         class Provider:
             def list_page(self, **kwargs):
-                del kwargs
-                return next(pages)
+                page = next(pages)
+                for item in page.items:
+                    item.metadata.update(kwargs["metadata"])
+                return page
 
             def connect(self, sandbox_id, *, request_timeout):
                 del request_timeout
@@ -491,7 +496,8 @@ class ExecutionBackendTests(unittest.TestCase):
             owner_key: owner_value,
         }
         self.assertEqual(
-            captured,
+            [{key: value for key, value in item.items()
+              if key != SANDBOX_GENERATION_METADATA_KEY} for item in captured],
             [
                 {
                     owner_key: owner_value,
@@ -515,6 +521,10 @@ class ExecutionBackendTests(unittest.TestCase):
                 },
             ],
         )
+        self.assertRegex(captured[0][SANDBOX_GENERATION_METADATA_KEY], r"^[a-f0-9]{32}$")
+        self.assertEqual(captured[0][SANDBOX_GENERATION_METADATA_KEY], captured[1][SANDBOX_GENERATION_METADATA_KEY])
+        self.assertEqual(captured[2][SANDBOX_GENERATION_METADATA_KEY], captured[3][SANDBOX_GENERATION_METADATA_KEY])
+        self.assertNotEqual(captured[0][SANDBOX_GENERATION_METADATA_KEY], captured[2][SANDBOX_GENERATION_METADATA_KEY])
         self.assertNotEqual(
             captured[0][ALIYUN_SANDBOX_SESSION_METADATA_KEY],
             captured[2][ALIYUN_SANDBOX_SESSION_METADATA_KEY],
@@ -741,7 +751,8 @@ class ExecutionBackendTests(unittest.TestCase):
             with self.assertRaises(ExecutionBackendClosedError):
                 backend._with_transport(lambda candidate: None)
             release.set()
-            self.assertEqual(operation_future.result(timeout=5), "finished-after-kill")
+            with self.assertRaises(ExecutionBackendClosedError):
+                operation_future.result(timeout=5)
 
         self.assertTrue(backend.closed)
         backend.close()
@@ -842,13 +853,14 @@ class ExecutionBackendTests(unittest.TestCase):
         class Provider:
             def list_page(_self, **kwargs):
                 nonlocal list_calls
-                del kwargs
                 list_calls += 1
                 if list_calls in {1, 2, 4}:
                     return SandboxRecoveryPage(items=())
                 if list_calls == 3:
+                    item = self._recovery_item("candidate-close-recovery")
+                    item.metadata.update(kwargs["metadata"])
                     return SandboxRecoveryPage(items=(
-                        self._recovery_item("candidate-close-recovery"),
+                        item,
                     ))
                 raise AssertionError("unexpected list call")
 
@@ -1008,6 +1020,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "4" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=factory,
             persistence_sandbox_factory=factory,
             transport_factory=lambda candidate: transports[candidate.sandbox_id],
@@ -1063,6 +1076,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "5" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=lambda _settings, _metadata: execution,
             persistence_sandbox_factory=fail_persistence_factory,
             transport_factory=lifecycle_transport,
@@ -1079,6 +1093,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "6" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=lambda _settings, _metadata: next(candidates),
             persistence_sandbox_factory=lambda _settings, _metadata: next(candidates),
             transport_factory=lifecycle_transport,
@@ -1098,6 +1113,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "7" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=lambda _settings, _metadata: candidate,
             persistence_sandbox_factory=lambda _settings, _metadata: candidate,
             transport_factory=lifecycle_transport,
@@ -1131,6 +1147,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "8" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=lambda _settings, _metadata: next(candidates),
             persistence_sandbox_factory=lambda _settings, _metadata: next(candidates),
             transport_factory=lifecycle_transport,
@@ -1169,6 +1186,7 @@ class ExecutionBackendTests(unittest.TestCase):
         backend = _AliyunSandboxExecutionBackend(
             "9" * 32,
             enabled_settings(),
+            automatic_maintenance=False,
             sandbox_factory=lambda _settings, _metadata: next(candidates),
             persistence_sandbox_factory=lambda _settings, _metadata: next(candidates),
             transport_factory=lifecycle_transport,

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      AGENT_DEFAULT_EXECUTION_BACKEND: local
+      ALIYUN_SANDBOX_PROBE_ENABLED: 'false'
+      ALIYUN_SANDBOX_RECOVERY_PROBE_ENABLED: 'false'
+      ALIYUN_SANDBOX_ALLOW_INTERNET_ACCESS: 'false'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Create project virtual environment and disable live gates
+        run: |
+          Get-ChildItem Env:RUN_* | ForEach-Object {
+            Set-Item -LiteralPath ('Env:' + $_.Name) -Value '0'
+            "$($_.Name)=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $venvRelative = if ($IsWindows) { '.venv/Scripts/python.exe' } else { '.venv/bin/python' }
+          $venvPython = Join-Path $env:GITHUB_WORKSPACE $venvRelative
+          "VENV_PYTHON=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install project dependencies
+        run: |
+          & $env:VENV_PYTHON -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run offline test suite
+        run: |
+          & $env:VENV_PYTHON -m unittest discover -s tests -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile Python modules
+        run: |
+          & $env:VENV_PYTHON -m compileall -q app tool tests scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check installed dependencies
+        run: |
+          & $env:VENV_PYTHON -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  source:
+    name: Archive tested source
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build source archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="agnet-study-${GITHUB_SHA}.zip"
+          git archive --format=zip --prefix="agnet-study-${GITHUB_SHA}/" --output="dist/$archive" HEAD
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

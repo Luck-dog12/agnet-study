@@ -26,6 +26,9 @@ from tests.test_agent import FakeClient, reply
 
 class PermissionModeTests(unittest.TestCase):
     def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
         self.temporary = tempfile.TemporaryDirectory(prefix="permission-tests-", dir="tests")
         base = Path(self.temporary.name)
         self.root = base / "项目"
@@ -410,6 +413,15 @@ class PermissionModeTests(unittest.TestCase):
 
         modes = []
         created = []
+        initialized = Event()
+        input_failures = []
+        output, error = io.StringIO(), io.StringIO()
+        original_submit = main_module.DaemonExecutor.submit
+
+        def submit(executor, *args, **kwargs):
+            future = original_submit(executor, *args, **kwargs)
+            future.add_done_callback(lambda _future: initialized.set())
+            return future
 
         class RecordingAgent(CodingAgent):
             def set_permission_mode(self, permission_mode):
@@ -429,6 +441,16 @@ class PermissionModeTests(unittest.TestCase):
             "/permissions partial-control",
             "exit",
         ))
+
+        def read(*_args):
+            item = next(inputs)
+            # Wait for the actual completed turn, not its early ready stream
+            # chunk: otherwise yes can become a pre-read deferred command.
+            if item == "/permissions full-access" and not initialized.wait(3):
+                input_failures.append(f"Timed out awaiting UI before {item!r}")
+                return "exit"
+            return item
+
         with tempfile.TemporaryDirectory(dir="tests") as root:
             with (
                 patch.object(main_module, "_SESSIONS_ROOT", Path(root) / "sessions"),
@@ -437,15 +459,18 @@ class PermissionModeTests(unittest.TestCase):
                 patch.object(main_module, "CodingAgent", side_effect=factory),
                 patch.object(main_module, "Observability", return_value=unittest.mock.Mock()),
                 patch.object(main_module, "MaintenanceService", return_value=unittest.mock.Mock()),
-                patch("builtins.input", side_effect=lambda *_args: next(inputs)),
-                patch("sys.stdout", io.StringIO()),
-                patch("sys.stderr", io.StringIO()),
+                patch.object(main_module.DaemonExecutor, "submit", new=submit),
+                patch("builtins.input", side_effect=read),
+                patch("sys.stdout", output),
+                patch("sys.stderr", error),
             ):
                 self.assertEqual(
                     main_module.main(["--new-session", "permission-live", "--plain"]),
                     0,
                 )
-        self.assertEqual(modes, ["full-access", "partial-control"])
+        diagnostics = f"stdout={output.getvalue()!r}\nstderr={error.getvalue()!r}"
+        self.assertEqual(input_failures, [], diagnostics)
+        self.assertEqual(modes, ["full-access", "partial-control"], diagnostics)
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0].permission_mode, "partial-control")
 

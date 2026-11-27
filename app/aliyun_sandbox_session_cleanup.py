@@ -21,6 +21,7 @@ from app.sandbox_config import SandboxSettings
 SANDBOX_OWNER_METADATA_KEY: Final[str] = "agnet-study.owner"
 SANDBOX_OWNER_METADATA_VALUE: Final[str] = "coding-agent-execution"
 SANDBOX_SESSION_METADATA_KEY: Final[str] = "agnet-study.session"
+SANDBOX_GENERATION_METADATA_KEY: Final[str] = "agnet-study.generation"
 
 _SESSION_ID_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}\Z")
 _ACTIVE_STATES: Final[tuple[str, str]] = ("running", "paused")
@@ -253,6 +254,7 @@ def cleanup_session_sandboxes(
     session_id: str,
     *,
     provider: SandboxRecoveryProvider | None = None,
+    generation_id: str | None = None,
 ) -> None:
     """Kill all validated active Sandboxes for one persistent host session.
 
@@ -263,12 +265,15 @@ def cleanup_session_sandboxes(
     if not isinstance(settings, SandboxSettings):
         raise TypeError("settings 必须是 SandboxSettings 实例。")
     safe_session_id = _validate_session_id(session_id)
+    safe_generation = None if generation_id is None else _validate_session_id(generation_id)
     settings.require_enabled()
     selected_provider = provider or _E2BSandboxRecoveryProvider(settings)
     expected_metadata = {
         SANDBOX_OWNER_METADATA_KEY: SANDBOX_OWNER_METADATA_VALUE,
         SANDBOX_SESSION_METADATA_KEY: safe_session_id,
     }
+    if safe_generation is not None:
+        expected_metadata[SANDBOX_GENERATION_METADATA_KEY] = safe_generation
     deadline = time.monotonic() + _TOTAL_TIMEOUT_SECONDS
 
     try:
@@ -313,6 +318,7 @@ __all__ = [
     "SANDBOX_OWNER_METADATA_KEY",
     "SANDBOX_OWNER_METADATA_VALUE",
     "SANDBOX_SESSION_METADATA_KEY",
+    "SANDBOX_GENERATION_METADATA_KEY",
     "SandboxRecoveryPage",
     "SandboxRecoveryProvider",
     "SandboxSessionCleanupError",

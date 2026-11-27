@@ -98,6 +98,7 @@ class _RemoteExecutionPermit:
         "authorization_kind",
         "nonce",
         "consumed",
+        "release_activity",
     )
 
     def __init__(
@@ -109,6 +110,7 @@ class _RemoteExecutionPermit:
         arguments_digest: str,
         authorization_kind: Literal["approval", "policy"],
         nonce: bytes,
+        release_activity: Callable[[], None] = lambda: None,
     ) -> None:
         self.runtime_identity = runtime_identity
         self.generation = generation
@@ -117,6 +119,7 @@ class _RemoteExecutionPermit:
         self.authorization_kind = authorization_kind
         self.nonce = nonce
         self.consumed = False
+        self.release_activity = release_activity
 
     def __repr__(self) -> str:
         return "_RemoteExecutionPermit(private, consumed={!r})".format(
@@ -127,18 +130,20 @@ class _RemoteExecutionPermit:
 class _WorkspaceReservation:
     """One idempotently releasable claim on the remote workspace data plane."""
 
-    __slots__ = ("_gate", "_lock", "_released")
+    __slots__ = ("_gate", "_lock", "_released", "_release_activity")
 
-    def __init__(self, gate: Lock) -> None:
+    def __init__(self, gate: Lock, release_activity: Callable[[], None] = lambda: None) -> None:
         self._gate = gate
         self._lock = RLock()
         self._released = False
+        self._release_activity = release_activity
 
     def release(self) -> None:
         with self._lock:
             if self._released:
                 return
             self._released = True
+            self._release_activity()
             self._gate.release()
 
 
@@ -222,7 +227,11 @@ class PreparedRemoteExecution:
             if self._state != "prepared":
                 raise ExecutionRuntimeError("prepared remote invocation 只能执行一次。")
             self._state = "starting"
-        reservation = self._runtime._reserve_workspace(self._generation)
+        try:
+            reservation = self._runtime._reserve_workspace(self._generation)
+        except BaseException:
+            self._runtime._revoke_authorization(self._permit)
+            raise
         try:
             output = self._runtime._invoke_group(
                 self._group,
@@ -242,6 +251,7 @@ class PreparedRemoteExecution:
                 self._runtime._fence_remote_uncertainty()
             raise
         finally:
+            self._runtime._revoke_authorization(self._permit)
             reservation.release()
         with self._lock:
             if self._state == "cancelled":
@@ -504,8 +514,20 @@ class ExecutionToolRuntime:
 
     def ensure_ready(self):
         with self._lock:
-            self._require_open()
+            if self._state != "open":
+                raise ExecutionRuntimeClosedError("执行 runtime 已关闭。")
+        # Preserve the backend's cached, sanitized creation diagnostic for
+        # repeated readiness checks without allowing another create attempt.
         return self._backend.ensure_ready()
+
+    def lifecycle_snapshot(self) -> dict[str, str | int | float | bool]:
+        if not self._remote:
+            return {"state": "local"}
+        return self._backend.lifecycle_snapshot()
+
+    def set_lifecycle_callback(self, callback: Callable[[str], None] | None) -> None:
+        if self._remote:
+            self._backend.set_lifecycle_callback(callback)
 
     def execute(self, tool_name: str, arguments: BaseModel) -> BaseModel:
         """Execute an unprivileged remote tool or require local Registry delegation."""
@@ -554,12 +576,15 @@ class ExecutionToolRuntime:
             raise RemoteExecutionAuthorizationDenied(
                 "远端文件变更必须使用专用 mutation transaction。"
             )
+        activity_release = self._backend.acquire_activity()
         try:
             authorized = authorization_callback()
         except BaseException as error:
             if not isinstance(error, Exception):
                 raise
             raise RemoteExecutionAuthorizationDenied("宿主授权过程失败。") from None
+        finally:
+            activity_release()
         if authorized is not True:
             raise RemoteExecutionAuthorizationDenied("宿主没有授权远端工具执行。")
         permit = self._issue_authorization(tool_name, validated, expected_kind)
@@ -606,12 +631,15 @@ class ExecutionToolRuntime:
                     "本地工具继续由现有 Registry 执行。"
                 )
             group = self._remote_group
+        activity_release = self._backend.acquire_activity()
         try:
             authorized = authorization_callback()
         except BaseException as error:
             if not isinstance(error, Exception):
                 raise
             raise RemoteExecutionAuthorizationDenied("宿主授权过程失败。") from None
+        finally:
+            activity_release()
         if authorized is not True:
             raise RemoteExecutionAuthorizationDenied("宿主没有授权远端工具执行。")
         permit = self._issue_authorization(tool_name, validated, expected_kind)
@@ -839,6 +867,7 @@ class ExecutionToolRuntime:
                 arguments_digest=digest,
                 authorization_kind=authorization_kind,
                 nonce=nonce,
+                release_activity=self._backend.acquire_activity(),
             )
             self._outstanding[nonce] = permit
             return permit
@@ -872,6 +901,7 @@ class ExecutionToolRuntime:
                 )
             self._outstanding.pop(authorization.nonce)
             authorization.consumed = True
+            authorization.release_activity()
 
     def _revoke_authorization(self, authorization: _RemoteExecutionPermit) -> None:
         with self._lock:
@@ -880,6 +910,7 @@ class ExecutionToolRuntime:
             if self._outstanding.get(authorization.nonce) is authorization:
                 self._outstanding.pop(authorization.nonce, None)
                 authorization.consumed = True
+                authorization.release_activity()
 
     def _require_generation(self, generation: int) -> None:
         with self._lock:
@@ -897,7 +928,12 @@ class ExecutionToolRuntime:
             if expected != self._generation:
                 raise ExecutionRuntimeClosedError("远端执行 generation 已失效。")
         self._workspace_gate.acquire()
-        reservation = _WorkspaceReservation(self._workspace_gate)
+        try:
+            release_activity = self._backend.acquire_activity()
+        except BaseException:
+            self._workspace_gate.release()
+            raise
+        reservation = _WorkspaceReservation(self._workspace_gate, release_activity)
         try:
             self._require_generation(expected)
         except BaseException:
@@ -957,7 +993,7 @@ class ExecutionToolRuntime:
         )
 
     def _require_open(self) -> None:
-        if self._state != "open":
+        if self._state != "open" or (self._remote and self._backend.closed):
             raise ExecutionRuntimeClosedError("执行 runtime 已关闭。")
 
     def begin_close(self) -> None:
@@ -967,6 +1003,8 @@ class ExecutionToolRuntime:
                 return
             self._state = "closing"
             self._generation += 1
+            for permit in self._outstanding.values():
+                permit.release_activity()
             self._outstanding.clear()
 
     def close(self) -> None:
@@ -988,7 +1026,7 @@ class ExecutionToolRuntime:
     @property
     def closed(self) -> bool:
         with self._lock:
-            return self._state != "open"
+            return self._state != "open" or (self._remote and self._backend.closed)
 
     def __repr__(self) -> str:
         return "ExecutionToolRuntime(backend={!r}, closed={!r})".format(

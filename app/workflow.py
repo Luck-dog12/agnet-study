@@ -567,6 +567,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CURRENT_SESSION_DIRECTORY = _PROJECT_ROOT / "data" / "sessions" / "current"
 _EVENT_FILE_PATTERN = re.compile(r"^([0-9]{16})\.json$")
 _TEMP_FILE_PATTERN = re.compile(r"^\.[0-9]{16}\.[0-9a-f]{32}\.tmp$")
+_SANDBOX_BUDGET_FILES = frozenset({"sandbox-budget.json", "sandbox-budget.json.lock"})
+_SANDBOX_BUDGET_TEMP_PATTERN = re.compile(r"sandbox-budget\.json\.[0-9a-f]{32}\.tmp\Z")
 _EXECUTION_BINDING_FILE = "execution.json"
 _EXECUTION_BINDING_MAX_BYTES = 1024
 _MAX_EVENT_BYTES = 16 * 1024 * 1024
@@ -1189,6 +1191,29 @@ class SessionEventWorkflow:
     def events(self) -> tuple[SessionEvent, ...]:
         return tuple(self._events)
 
+    def _revoked_model_turns(self) -> frozenset[str]:
+        """A failed model continuation revokes its interrupted unfinished ancestors.
+
+        Generic turn errors also represent tool limits/local failures. Those
+        keep their task context so a fresh user request can explicitly retry.
+        """
+        unfinished: set[str] = set()
+        revoked: set[str] = set()
+        model_failures: set[str] = set()
+        for event in self._events:
+            data = event.data
+            if isinstance(data, TurnStartEventData):
+                unfinished.add(data.turn_id)
+            elif isinstance(data, AssistantAttemptEventData) and data.kind == "error":
+                model_failures.add(data.turn_id)
+            elif isinstance(data, TurnEndEventData):
+                if data.kind == "error" and data.turn_id in model_failures:
+                    revoked.update(unfinished)
+                    unfinished.clear()
+                elif data.kind != "interrupted":
+                    unfinished.clear()
+        return frozenset(revoked)
+
     @property
     def structured_events(self) -> tuple[SessionEventStructuredView, ...]:
         """统一只读视图；不会改变或重新提交底层 v1 事件。"""
@@ -1493,6 +1518,9 @@ class SessionEventWorkflow:
         for item in entries:
             if item.name in {"session.json", _EXECUTION_BINDING_FILE, "writer.lock"}:
                 continue
+            if item.name in _SANDBOX_BUDGET_FILES or _SANDBOX_BUDGET_TEMP_PATTERN.fullmatch(item.name):
+                _safe_regular_file(item, missing_ok=False)
+                continue
             if _EVENT_FILE_PATTERN.fullmatch(item.name) or _TEMP_FILE_PATTERN.fullmatch(
                 item.name
             ):
@@ -1566,6 +1594,9 @@ class SessionEventWorkflow:
                     numbered.append((int(match.group(1)), self._directory / entry.name))
                     continue
                 if entry.name in {"session.json", _EXECUTION_BINDING_FILE, "writer.lock"}:
+                    continue
+                if entry.name in _SANDBOX_BUDGET_FILES or _SANDBOX_BUDGET_TEMP_PATTERN.fullmatch(entry.name):
+                    _safe_regular_file(self._directory / entry.name, missing_ok=False)
                     continue
                 if _TEMP_FILE_PATTERN.fullmatch(entry.name):
                     _safe_regular_file(self._directory / entry.name, missing_ok=False)
@@ -1763,6 +1794,7 @@ class SessionEventWorkflow:
         """
         shadowed: set[int] = set()
         replacements: dict[int, CompactionSummaryEventData] = {}
+        revoked_turns = self._revoked_model_turns()
         pending_recovery_keys = {
             (item.turn_id, item.step, item.call.id)
             for item in self.unresolved_external_calls()
@@ -1781,6 +1813,13 @@ class SessionEventWorkflow:
                 assert isinstance(data, CompactionSummaryEventData)
                 if data.replace_end_seq >= event.seq:
                     raise SessionEventError("摘要不能替换自身或未来事件。")
+                # Free-form summaries may repeat a revoked request. Keep the
+                # original audited tool facts instead of re-authorizing it.
+                if any(
+                    getattr(item.data, "turn_id", None) in revoked_turns
+                    for item in self._events[data.replace_start_seq - 1:data.replace_end_seq]
+                ):
+                    continue
                 for previous_start in tuple(replacements):
                     if data.replace_start_seq <= previous_start <= data.replace_end_seq:
                         replacements.pop(previous_start)
@@ -1828,19 +1867,29 @@ class SessionEventWorkflow:
                         raise SessionEventError(
                             "新用户消息前的工具消息组尚未闭合。"
                         )
-                    messages.append(UserMessage(content=data.message.content))
+                    if data.turn_id in revoked_turns:
+                        messages.append(SystemMessage(content=(
+                            f"历史轮 {data.turn_id} 因故障已撤销执行授权；原始用户指令已隔离。"
+                            "该轮保留的工具调用和结果仅是已发生的事实，不得继续或重放旧任务。"
+                            "已产生的副作用未撤销，未知结果仍必须按现有恢复规则核验。"
+                        )))
+                    else:
+                        messages.append(UserMessage(content=data.message.content))
                 elif isinstance(data, AssistantMessageEventData):
                     if pending_tool_key is not None:
                         raise SessionEventError(
                             "新模型消息前的工具消息组尚未闭合。"
                         )
+                    revoked = data.turn_id in revoked_turns
+                    if revoked and not data.message.tool_calls:
+                        continue
                     assistant = AssistantMessage(
-                        content=data.message.content,
+                        content=None if revoked else data.message.content,
                         tool_calls=[
                             self._tool_call_from_snapshot(call)
                             for call in data.message.tool_calls
                         ],
-                        reasoning_content=data.message.reasoning_content,
+                        reasoning_content=None if revoked else data.message.reasoning_content,
                     )
                     messages.append(assistant)
                     call_ids = tuple(call.id for call in assistant.tool_calls)
@@ -1911,6 +1960,11 @@ class SessionEventWorkflow:
                         f"source={data.source}\ndetails={data.details_json}"
                     )))
                 elif isinstance(data, ControlHostEventData):
+                    from app.model_guard import MODEL_GUARD_SOURCE
+
+                    if data.source == MODEL_GUARD_SOURCE:
+                        # Local latch controls are audit data, never user input.
+                        continue
                     append_delayable(UserMessage(content=(
                         f"{event.display_marker}\n宿主控制事件：{data.message}\n"
                         f"source={data.source}\ncommand={data.command}\n"

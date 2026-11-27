@@ -103,7 +103,7 @@ sh agent.sh --new-session first-task
 | --- | --- |
 | 普通自然语言 | 发起当前任务。 |
 | `/plan 需求` | 进入本次需求的规划流程。 |
-| `/status` | 查看当前会话和运行配置。 |
+| `/status` | 统一查看运行阶段、最近请求结果、后台任务数量、待恢复数量和运行配置。 |
 | `/permissions` | 查看权限模式及切换方式。 |
 | `/permissions partial-control` | 在空闲提示符切换为受控权限。 |
 | `/permissions full-access` | 请求提升权限，终端会要求明确确认。 |
@@ -115,6 +115,28 @@ sh agent.sh --new-session first-task
 | `exit` 或 `quit` | 退出。 |
 
 遇到审批或规划选项时，按当前提示回复。执行结果无法确认的修改会进入恢复核验流程；已经发生的操作不会因为模型报错而自动撤销。
+
+`/status` 和 Python 宿主接口 `agent.get_status()` 使用同一套状态查询。`run_state`
+表示前台阶段：`idle`、`running`、`waiting_approval`、`waiting_plan`、
+`waiting_async`、`stopped` 或 `failed`。最近一轮的 `completed` / `interrupted` /
+`error` 单独保存在 `last_turn.kind`，不会把空闲误认为任务成功。`completed` 表示
+该轮回复结束，不保证用户目标已经通过验收；`/interrupt` 仍会触发重新评估和继续执行。
+
+已有 `CodingAgent` 实例时，可以直接查询并转换成 JSON 数据供界面或 API 使用：
+
+```python
+status = agent.get_status()
+print(status.run_state)
+print(status.last_turn.kind if status.last_turn else "尚无已结束的请求")
+print(status.task_counts.active, status.pending_recovery_count)
+payload = status.model_dump(mode="json")
+```
+
+返回值是不可变快照，含当前/最近轮次、安全的后台任务元数据、任务统计和事件序号
+`last_event_seq`。查询不调用模型、不创建沙箱、不写入或强制刷新事件；任务事实取自
+一次已提交事件快照，尚未提交的进度可能稍有延迟。前台空闲时，先前派发的后台任务
+仍可能运行，应同时看 `task_counts.active`。Plan 成功前没有持久轮次，因此规划期间
+`mode="plan"`，而 `current_turn` 可以为空；取消 Plan 不改变最近持久轮次。
 
 ## 权限与执行后端
 
@@ -193,6 +215,11 @@ agnet-study/
 
 ## 开发与验证
 
+GitHub Actions 会在推送 `main`、`codex/**` 或向 `main` 提交 PR 时，在 Windows/Ubuntu
+和 Python 3.11/3.13 上运行离线检查。全部通过后可下载该提交的源码包；推送与项目版本
+一致的 `v*` 标签会在重新通过同一套检查后发布到 GitHub Releases。具体触发方式、
+权限和发布步骤见 [CI/CD 说明](docs/CI_CD.md)。自动 CI 不调用真实模型或云沙箱。
+
 在项目根目录使用虚拟环境运行离线回归。下面先关闭当前终端中可能遗留的 `RUN_*` 测试开关，避免误启用真实云测试：
 
 ```powershell
@@ -204,6 +231,20 @@ Get-ChildItem Env:RUN_* | ForEach-Object { Set-Item -LiteralPath ("Env:" + $_.Na
 ```
 
 真实云测试有独立开关，需要有效凭据并会创建收费资源；执行前按运行手册确认测试范围、清理和验证步骤。具体历史验证结果与尚未完成的工作见 [项目进度](AGENT_STATUS.md) 和 [云端验证报告](ALIYUN_CLOUD_VALIDATION_REPORT.md)。
+
+统一状态查询有独立的真实模型测试，覆盖流式执行与完成、生成中主动停止，以及一次
+固定的本地后台计算。它使用现有模型配置并产生模型请求费用，最多 5 次请求，不创建云沙箱；
+默认离线回归会跳过这些用例。需要运行时在项目虚拟环境中执行：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:RUN_AGENT_STATUS_LIVE_E2E = "1"
+try {
+    .\.venv\Scripts\python.exe -m unittest tests.test_agent_status_live_e2e -v
+} finally {
+    Remove-Item Env:RUN_AGENT_STATUS_LIVE_E2E -ErrorAction SilentlyContinue
+}
+```
 
 ## 常见问题
 

@@ -29,6 +29,7 @@ from unittest.mock import Mock, patch
 from pydantic import SecretStr
 
 from app.agent import CodingAgent
+from app.agent_status import AgentStatus
 from app.async_tasks import AsyncTaskSnapshot
 from app.config import Settings
 from app.execution_backend import (
@@ -2450,6 +2451,27 @@ def _task(agent: CodingAgent, call_id: str) -> AsyncTaskSnapshot:
     return matches[0]
 
 
+def _assert_completed_status(test: unittest.TestCase, agent: CodingAgent) -> AgentStatus:
+    """Compare the public read-only view with real settled task state."""
+    status = agent.get_status()
+    test.assertEqual(status.run_state, "idle")
+    test.assertIsNone(status.mode)
+    test.assertIsNone(status.current_turn)
+    test.assertIsNotNone(status.last_turn)
+    assert status.last_turn is not None
+    test.assertEqual(status.last_turn.kind, "completed")
+    test.assertEqual(status.task_counts.active, 0)
+    tasks = agent.list_async_tasks()
+    test.assertEqual(status.task_counts.total, len(tasks))
+    # A mismatch must not print provider/session/task coordinates.
+    test.assertTrue(
+        {item.task_id: item.state for item in status.tasks}
+        == {item.task_id: item.status.value for item in tasks},
+        "Public task states disagree with settled task-manager states.",
+    )
+    return status
+
+
 def _bash_result(
     agent: CodingAgent, call_id: str, *, expect_zero: bool
 ) -> BashShellOutput:
@@ -2606,8 +2628,12 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
         snapshot = _synthetic_snapshot()
         host_before = _host_fingerprint()
         approvals: list[ToolConfirmationRequest] = []
+        approval_agent: CodingAgent | None = None
+        approval_states: list[str] = []
 
         def approve(request: ToolConfirmationRequest) -> bool:
+            assert approval_agent is not None
+            approval_states.append(approval_agent.get_status().run_state)
             approvals.append(request)
             return True
 
@@ -2636,6 +2662,11 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
                     settings, session_directory, snapshot,
                     _Client(script_a), approve, backend_stages_a, recover=False,
                 ) as (agent_a, runtime_a):
+                    approval_agent = agent_a
+                    initial_status = agent_a.get_status()
+                    self.assertEqual(initial_status.run_state, "idle")
+                    self.assertIsNone(initial_status.last_turn)
+                    self.assertEqual(initial_status.task_counts.total, 0)
                     answer_a = agent_a.run("完成合成项目的远端修复闭环。")
                     readiness_a = _diagnose_backend_readiness(
                         runtime_a, backend_stages_a
@@ -2651,6 +2682,7 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
                     self.assertIsInstance(results_a["a_edit"].output, EditorFileOutput)
                     _bash_result(agent_a, "a_test_fail", expect_zero=False)
                     _bash_result(agent_a, "a_test_pass", expect_zero=True)
+                    _assert_completed_status(self, agent_a)
                     for call_id in (
                         "a_protected", "a_escape", "a_pending_write", "a_pending_list",
                     ):
@@ -2681,8 +2713,10 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
                         results_a["a_full_edit"].output, EditorFileOutput
                     )
                     _bash_result(agent_a, "a_full_test", expect_zero=True)
+                    completed_a = _assert_completed_status(self, agent_a)
                 assert runtime_a is not None
                 self.assertTrue(runtime_a.closed)
+                self.assertEqual(agent_a.get_status().run_state, "stopped")
 
                 script_b = _ScriptB()
                 backend_stages_b = _BackendStageRecorder()
@@ -2690,6 +2724,14 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
                     settings, session_directory, snapshot,
                     _Client(script_b), approve, backend_stages_b, recover=True,
                 ) as (agent_b, runtime_b):
+                    approval_agent = agent_b
+                    restored_status = agent_b.get_status()
+                    self.assertEqual(restored_status.run_state, "idle")
+                    self.assertTrue(
+                        restored_status.last_turn == completed_a.last_turn,
+                        "Restored status lost the last completed turn.",
+                    )
+                    self.assertEqual(restored_status.task_counts, completed_a.task_counts)
                     answer_b = agent_b.run("在 Sandbox B 中复验持久化修改。")
                     readiness_b = _diagnose_backend_readiness(
                         runtime_b, backend_stages_b
@@ -2727,8 +2769,10 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
                     self.assertEqual(restored_full.path, _FULL_ACCESS_PATH)
                     self.assertEqual(restored_full.content, _FULL_ACCESS_FINAL)
                     _bash_result(agent_b, "b_test_pass", expect_zero=True)
+                    _assert_completed_status(self, agent_b)
                 assert runtime_b is not None
                 self.assertTrue(runtime_b.closed)
+                self.assertEqual(agent_b.get_status().run_state, "stopped")
                 _verify_provider_session_has_no_active_sandboxes(
                     settings,
                     session_id or "",
@@ -2751,6 +2795,7 @@ class AliyunSandboxLiveAgentE2ETests(unittest.TestCase):
             if request.tool_name == "bash_shell" and request.operation == "unittest"
         ]
         self.assertGreaterEqual(len(unittest_approvals), 3)
+        self.assertEqual(approval_states, ["waiting_approval"] * len(approvals))
 
 
 @unittest.skipUnless(
@@ -2767,8 +2812,13 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
         settings.require_recovery_enabled()
         host_before = _host_fingerprint()
         approvals: list[ToolConfirmationRequest] = []
+        approval_agent: CodingAgent | None = None
+        approval_states: list[str] = []
+        bound_statuses: list[AgentStatus] = []
 
         def approve(request: ToolConfirmationRequest) -> bool:
+            assert approval_agent is not None
+            approval_states.append(approval_agent.get_status().run_state)
             approvals.append(request)
             return True
 
@@ -2779,6 +2829,10 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
             prepared: PreparedRemoteExecution, handle: object
         ) -> None:
             original_bind_handle(prepared, handle)  # type: ignore[arg-type]
+            # Observe the real running task before waking the scripted cancel.
+            # No task locks, extra tools or synthetic lifecycle events are used.
+            assert approval_agent is not None
+            bound_statuses.append(approval_agent.get_status())
             remote_handle_bound.set()
 
         runtime: ExecutionToolRuntime | None = None
@@ -2816,6 +2870,7 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
                     backend_stages,
                     recover=False,
                 ) as (agent, runtime):
+                    approval_agent = agent
                     readiness = _diagnose_backend_readiness(
                         runtime, backend_stages
                     )
@@ -2834,6 +2889,12 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
                     script.raise_recorded_failure(readiness)
                     self.assertIn("取消已生效", answer)
                     self.assertTrue(remote_handle_bound.is_set())
+                    self.assertTrue(bound_statuses)
+                    running_status = bound_statuses[0]
+                    self.assertEqual(running_status.run_state, "running")
+                    self.assertIsNotNone(running_status.current_turn)
+                    self.assertEqual(running_status.task_counts.running, 1)
+                    self.assertEqual(running_status.task_counts.active, 1)
 
                     results = _results(agent)
                     self.assertEqual(results["cancel_long"].status, "accepted")
@@ -2880,9 +2941,19 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
                     self.assertIn("async/task/cancelled", task_events)
                     self.assertIn("async/task/late_result", task_events)
                     self.assertNotIn("async/task/completed", task_events)
+                    settled_status = _assert_completed_status(self, agent)
+                    self.assertEqual(settled_status.task_counts.cancelled, 1)
+                    self.assertEqual(settled_status.task_counts.completed, 1)
+                    self.assertTrue(
+                        any(item.task_id == cancelled.task_id and item.state == "cancelled"
+                            for item in settled_status.tasks),
+                        "Late remote result changed the public cancelled state.",
+                    )
                     self.assertFalse(runtime.closed)
                 assert runtime is not None
                 self.assertTrue(runtime.closed)
+                self.assertEqual(agent.get_status().run_state, "stopped")
+                self.assertEqual(agent.get_status().task_counts.cancelled, 1)
                 _verify_provider_session_has_no_active_sandboxes(
                     settings,
                     session_id or "",
@@ -2897,6 +2968,7 @@ class AliyunSandboxLiveCancellationE2ETests(unittest.TestCase):
             [(request.tool_name, request.operation) for request in approvals],
             [("bash_shell", "unittest"), ("bash_shell", "unittest")],
         )
+        self.assertEqual(approval_states, ["waiting_approval"] * len(approvals))
 
 
 @unittest.skipUnless(

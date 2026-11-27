@@ -19,6 +19,7 @@ class TerminalInputTests(unittest.TestCase):
         self.assertNotIn("/mode plan", names)
         self.assertNotIn("/mode act", names)
         self.assertEqual(filter_command_candidates("/mo"), ())
+        self.assertNotIn("/model reset", names)
         self.assertEqual(
             [name for name, _description in filter_command_candidates("/permissions f")],
             ["/permissions full-access"],

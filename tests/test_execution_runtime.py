@@ -18,6 +18,7 @@ from tests.sandbox_cleanup_fakes import empty_recovery_provider
 
 
 def AliyunSandboxExecutionBackend(*args, **kwargs):
+    kwargs.setdefault("automatic_maintenance", False)
     kwargs.setdefault("recovery_provider", empty_recovery_provider())
     if "sandbox_factory" in kwargs and "persistence_sandbox_factory" not in kwargs:
         class PersistenceSandbox:

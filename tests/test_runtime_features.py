@@ -21,6 +21,11 @@ from tests.test_agent import FakeClient, reply
 
 
 class RuntimeFeatureTests(unittest.TestCase):
+    def setUp(self):
+        from tests.model_service_helpers import ready_model_service_patch
+
+        self.enterContext(ready_model_service_patch())
+
     def _run_emergency_cli(self, client, inputs, *, session_name, patches=()):
         from app import main as main_module
 
@@ -288,6 +293,7 @@ class RuntimeFeatureTests(unittest.TestCase):
             self.assertIn("2. 平衡", output)
             self.assertIn("3. 完整", output)
             self.assertIn("# 终端选择计划", output)
+            self.assertNotIn("已排队", output)
             self.assertEqual(len(client.completions.requests), 3)
             self.assertIn(
                 "open_questions 必须为 []",
@@ -389,6 +395,7 @@ class RuntimeFeatureTests(unittest.TestCase):
         self.assertIn("2. 平衡", stdout.getvalue())
         self.assertIn("3. 完整", stdout.getvalue())
         self.assertIn("# 专属交互计划", stdout.getvalue())
+        self.assertNotIn("已排队", stdout.getvalue())
         self.assertEqual([record[2] for record in calls[:3]], [
             "/plan 规划交互", "2", "exit",
         ])
@@ -419,6 +426,11 @@ class RuntimeFeatureTests(unittest.TestCase):
 
             def close(self):
                 return None
+
+            def get_status(self):
+                from app.agent_status import project_agent_status
+
+                return project_agent_status("a" * 32, ())
 
         inputs: Queue[str] = Queue()
         inputs.put("处理任务")

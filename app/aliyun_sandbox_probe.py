@@ -81,6 +81,8 @@ def _create_sandbox(settings: SandboxSettings, metadata: dict[str, str]) -> Any:
         "api_url": settings.api_url,
         "domain": settings.domain,
         "timeout": settings.timeout_seconds,
+        "request_timeout": 10,
+        "lifecycle": {"on_timeout": "kill", "auto_resume": False},
         "metadata": metadata,
         "allow_internet_access": settings.allow_internet_access,
     }
